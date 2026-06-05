@@ -1,857 +1,2500 @@
-# # app.py — Multilingual PDF Chatbot (EasyOCR + Tesseract fallback, FAISS embeddings, Groq LLM)
+
+# #Completed Final Year - Major Project
+
+# app.py — IntelliDoc: AI-Powered Multilingual Document Analysis System
+import os
+import streamlit as st
+from dotenv import load_dotenv
+import fitz  # PyMuPDF
+from PIL import Image
+import pytesseract
+import numpy as np
+import faiss
+from groq import Groq
+from langdetect import detect, DetectorFactory
+from sklearn.feature_extraction.text import TfidfVectorizer
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import io
+import json
+from datetime import datetime
+import pandas as pd
+import cv2
+import base64
+import re
+
+DetectorFactory.seed = 0
+
+# -------------------- Load ENV --------------------
+load_dotenv()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+TESSERACT_CMD = os.getenv("TESSERACT_CMD", r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+TESSDATA_PREFIX = os.getenv("TESSDATA_PREFIX")
+
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+if TESSDATA_PREFIX:
+    os.environ["TESSDATA_PREFIX"] = TESSDATA_PREFIX
+
+# -------------------- Config --------------------
+OCR_LANGS = "eng+kan+hin+tam+tel+mar+mal+guj+ben+pan"
+TOP_K = 8
+SIMILARITY_THRESHOLD = 0.1
+CHUNK_SIZE = 1500
+CHUNK_OVERLAP = 300
+MAX_CONTEXT_CHARS = 4500
+MAX_WORKERS = 4
+
+# -------------------- Clients --------------------
+groq_client = Groq(api_key=GROQ_API_KEY)
+
+@st.cache_resource
+def get_tfidf_vectorizer():
+    return TfidfVectorizer(
+        max_features=1000,
+        ngram_range=(1, 2),
+        min_df=1,
+        stop_words=None
+    )
+
+# -------------------- Table Extraction --------------------
+def extract_tables_from_pdf(pdf_bytes, doc_name):
+    """Extract tables from PDF"""
+    tables = []
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for page_num, page in enumerate(doc, start=1):
+            try:
+                # Extract tables using PyMuPDF
+                page_tables = page.find_tables()
+                if page_tables:
+                    for table_idx, table in enumerate(page_tables.tables):
+                        try:
+                            table_data = table.extract()
+                            if table_data:
+                                df = pd.DataFrame(table_data[1:], columns=table_data[0] if table_data else None)
+                                tables.append({
+                                    'doc': doc_name,
+                                    'page': page_num,
+                                    'table_num': table_idx + 1,
+                                    'data': df
+                                })
+                        except:
+                            continue
+            except:
+                continue
+        doc.close()
+    except Exception as e:
+        st.warning(f"Table extraction error: {e}")
+    return tables
+
+# -------------------- Chart/Diagram Detection --------------------
+def detect_visual_elements(pdf_bytes, doc_name):
+    """Detect charts, diagrams, flowcharts in PDF"""
+    visuals = []
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for page_num, page in enumerate(doc, start=1):
+            # Get images from page
+            image_list = page.get_images()
+            
+            if image_list:
+                for img_idx, img_info in enumerate(image_list):
+                    try:
+                        xref = img_info[0]
+                        base_image = doc.extract_image(xref)
+                        image_bytes = base_image["image"]
+                        
+                        # Convert to PIL Image
+                        img = Image.open(io.BytesIO(image_bytes))
+                        
+                        # Analyze image to detect if it's a chart/diagram
+                        img_array = np.array(img.convert('RGB'))
+                        
+                        # Simple heuristics to detect charts/diagrams
+                        # Check for lines, geometric shapes, etc.
+                        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+                        edges = cv2.Canny(gray, 50, 150)
+                        
+                        # Count edge pixels (charts have lots of edges)
+                        edge_ratio = np.count_nonzero(edges) / edges.size
+                        
+                        visual_type = "Unknown"
+                        if edge_ratio > 0.05:
+                            # Try to determine type
+                            if edge_ratio > 0.15:
+                                visual_type = "Flowchart/Diagram"
+                            elif edge_ratio > 0.08:
+                                visual_type = "Chart/Graph"
+                            else:
+                                visual_type = "Image"
+                        
+                        visuals.append({
+                            'doc': doc_name,
+                            'page': page_num,
+                            'type': visual_type,
+                            'image': img,
+                            'size': img.size
+                        })
+                    except:
+                        continue
+        doc.close()
+    except Exception as e:
+        st.warning(f"Visual detection error: {e}")
+    return visuals
+
+# -------------------- Smart OCR Detection --------------------
+def needs_ocr(page):
+    """Quickly determine if a page needs OCR"""
+    text = page.get_text("text")
+    if len(text.strip()) > 50:
+        return False
+    image_list = page.get_images()
+    if len(image_list) > 0:
+        return True
+    return True
+
+def extract_text_from_page_fast(page, page_num, use_ocr=False):
+    """Fast text extraction with page number tracking"""
+    if not use_ocr:
+        text = page.get_text("text")
+        if len(text.strip()) > 50:
+            return text.strip(), page_num
+    
+    try:
+        mat = fitz.Matrix(2.0, 2.0)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img_data = pix.tobytes("png")
+        img = Image.open(io.BytesIO(img_data))
+        
+        text = pytesseract.image_to_string(
+            img, 
+            lang=OCR_LANGS,
+            config='--psm 6 --oem 3'
+        )
+        return text.strip(), page_num
+    except Exception as e:
+        return "", page_num
+
+# -------------------- Parallel PDF Processing --------------------
+def process_page(page_info):
+    """Process a single page"""
+    page_num, page, doc_name, force_ocr = page_info
+    
+    try:
+        use_ocr = force_ocr or needs_ocr(page)
+        text, pg_num = extract_text_from_page_fast(page, page_num + 1, use_ocr=use_ocr)
+        
+        if text:
+            return {
+                'page_num': page_num,
+                'actual_page': page_num + 1,
+                'text': text,
+                'doc_name': doc_name,
+                'success': True
+            }
+        return {'success': False}
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+def extract_text_from_pdf_parallel(pdf_bytes, doc_name, force_ocr=False):
+    """Extract text from PDF using parallel processing"""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        total_pages = len(doc)
+        
+        page_tasks = [
+            (i, doc[i], doc_name, force_ocr) 
+            for i in range(total_pages)
+        ]
+        
+        results = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_page = {
+                executor.submit(process_page, task): task[0] 
+                for task in page_tasks
+            }
+            
+            for future in as_completed(future_to_page):
+                result = future.result()
+                if result.get('success'):
+                    results.append(result)
+        
+        doc.close()
+        results.sort(key=lambda x: x['page_num'])
+        
+        full_text = ""
+        for r in results:
+            page_num = r['actual_page']
+            text = r['text']
+            full_text += f"\n\n[Page {page_num}]\n{text}"
+        
+        return full_text, len(results), total_pages
+        
+    except Exception as e:
+        st.error(f"PDF processing error: {e}")
+        return "", 0, 0
+
+def extract_text_from_image_fast(image_file):
+    """Fast image OCR"""
+    try:
+        img = Image.open(image_file)
+        max_size = 2000
+        if max(img.size) > max_size:
+            ratio = max_size / max(img.size)
+            new_size = tuple(int(dim * ratio) for dim in img.size)
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
+        
+        text = pytesseract.image_to_string(
+            img,
+            lang=OCR_LANGS,
+            config='--psm 6 --oem 3'
+        )
+        return text.strip()
+    except Exception as e:
+        st.warning(f"Image OCR failed: {e}")
+        return ""
+
+# -------------------- Chunking --------------------
+def chunk_text_smart(text, source_name, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """Smart chunking with page tracking"""
+    if not text or len(text.strip()) < 50:
+        return [], []
+    
+    chunks, meta = [], []
+    pages = text.split('[Page ')
+    
+    for page_section in pages:
+        if not page_section.strip():
+            continue
+        
+        page_num = None
+        if ']' in page_section:
+            try:
+                page_num = int(page_section.split(']')[0])
+                page_text = page_section.split(']', 1)[1]
+            except:
+                page_text = page_section
+        else:
+            page_text = page_section
+        
+        start = 0
+        chunk_id = 0
+        
+        while start < len(page_text):
+            end = start + chunk_size
+            chunk = page_text[start:end].strip()
+            
+            if chunk:
+                chunks.append(chunk)
+                meta.append({
+                    "source": source_name,
+                    "page": page_num,
+                    "chunk_id": chunk_id
+                })
+                chunk_id += 1
+            
+            start += chunk_size - overlap
+    
+    return chunks, meta
+
+# -------------------- TF-IDF Embeddings --------------------
+def embed_texts_tfidf(texts, vectorizer=None):
+    """Fast TF-IDF embeddings"""
+    try:
+        if vectorizer is None:
+            vectorizer = get_tfidf_vectorizer()
+            matrix = vectorizer.fit_transform(texts)
+        else:
+            matrix = vectorizer.transform(texts)
+        
+        return matrix.toarray().astype("float32"), vectorizer
+    except Exception as e:
+        st.error(f"Embedding error: {e}")
+        return np.zeros((len(texts), 100), dtype="float32"), None
+
+def build_faiss_index(emb_np):
+    """Build FAISS index"""
+    if emb_np is None or emb_np.shape[0] == 0:
+        raise ValueError("Empty embeddings")
+    
+    norms = np.linalg.norm(emb_np, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    emb_np = emb_np / norms
+    
+    dim = emb_np.shape[1]
+    idx = faiss.IndexFlatIP(dim)
+    idx.add(emb_np)
+    return idx
+
+# -------------------- Language Utilities --------------------
+LANG_MAP = {
+    "kn": "Kannada", "hi": "Hindi", "ta": "Tamil", "te": "Telugu",
+    "mr": "Marathi", "ml": "Malayalam", "gu": "Gujarati",
+    "bn": "Bengali", "pa": "Punjabi", "en": "English"
+}
+
+LANG_CODES = {
+    "english": "en", "kannada": "kn", "hindi": "hi", "tamil": "ta",
+    "telugu": "te", "marathi": "mr", "malayalam": "ml", "gujarati": "gu",
+    "bengali": "bn", "punjabi": "pa"
+}
+
+def detect_question_language(question):
+    try:
+        return detect(question)
+    except:
+        return "en"
+
+def extract_target_language(question):
+    q_lower = question.lower()
+    for lang_name, code in LANG_CODES.items():
+        if f"in {lang_name}" in q_lower or f"to {lang_name}" in q_lower:
+            return code
+    return None
+
+# -------------------- Audio Functions --------------------
+def get_audio_input():
+    """Get audio input using HTML5 audio recorder"""
+    audio_html = """
+    <div style="text-align: center; padding: 20px;">
+        <p style="color: #E0E0E0;">🎤 <strong>Voice Input Feature</strong></p>
+        <p style="color: #888; font-size: 0.9em;">Note: Audio input requires microphone permissions.<br>
+        Install speech_recognition and pyaudio packages for full functionality:<br>
+        <code>pip install SpeechRecognition pyaudio</code></p>
+    </div>
+    """
+    st.markdown(audio_html, unsafe_allow_html=True)
+
+def text_to_speech_button(text, lang='en'):
+    """Create audio download button"""
+    try:
+        # Note: Install gtts package: pip install gtts
+        from gtts import gTTS
+        
+        tts = gTTS(text=text, lang=lang, slow=False)
+        fp = io.BytesIO()
+        tts.write_to_fp(fp)
+        fp.seek(0)
+        
+        audio_base64 = base64.b64encode(fp.read()).decode()
+        audio_html = f"""
+        <audio controls autoplay style="width: 100%;">
+            <source src="data:audio/mp3;base64,{audio_base64}" type="audio/mp3">
+        </audio>
+        """
+        st.markdown(audio_html, unsafe_allow_html=True)
+        return True
+    except ImportError:
+        st.info("💡 Install gtts for audio output: `pip install gtts`")
+        return False
+    except Exception as e:
+        st.warning(f"Audio generation error: {e}")
+        return False
+
+# -------------------- QA & Summarization --------------------
+def ask_groq_with_context(context, question, target_lang=None):
+    """Answer questions using context"""
+    if target_lang:
+        response_lang = LANG_MAP.get(target_lang, "the requested language")
+    else:
+        question_lang = detect_question_language(question)
+        response_lang = LANG_MAP.get(question_lang, "English")
+    
+    is_translation = any(kw in question.lower() for kw in 
+                         ["translate", "convert", "change to", "in kannada", "in hindi", 
+                          "in telugu", "in marathi", "in tamil", "in english"])
+    
+    if is_translation:
+        prompt = f"""You are a multilingual translator.
+
+CONTEXT from documents:
+{context}
+
+USER REQUEST: {question}
+
+Translate the relevant information to {response_lang}. Be accurate and preserve details.
+
+Response in {response_lang}:"""
+    else:
+        prompt = f"""Answer this question using ONLY the CONTEXT provided.
+
+CONTEXT:
+{context}
+
+QUESTION: {question}
+
+Answer in {response_lang}. If not in context, say "I cannot find this in the documents."
+
+Answer:"""
+    
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=1000
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Error: {e}"
+
+def summarize_document(text, target_lang="en"):
+    """Generate summary"""
+    if not text or len(text.strip()) < 50:
+        return "Insufficient text to summarize."
+    
+    text_snippet = text[:8000]
+    lang_name = LANG_MAP.get(target_lang, "English")
+    
+    prompt = f"""Summarize this document in {lang_name}. Include main topic, key points, and important details.
+
+{text_snippet}
+
+Summary:"""
+    
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=800
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Summarization failed: {e}"
+
+# -------------------- Download Functions --------------------
+def create_chat_download(chat_history):
+    """Create downloadable chat history"""
+    chat_text = f"IntelliDoc Chat History\n"
+    chat_text += f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+    chat_text += "="*80 + "\n\n"
+    
+    for item in chat_history:
+        if len(item) == 2:
+            role, message = item
+            source_pages = None
+        else:
+            role, message, source_pages = item
+        
+        if role == "user":
+            chat_text += f"USER:\n{message}\n\n"
+        else:
+            chat_text += f"INTELLIDOC:\n{message}\n"
+            if source_pages:
+                chat_text += f"Sources: {source_pages}\n"
+            chat_text += "\n"
+        chat_text += "-"*80 + "\n\n"
+    
+    return chat_text
+
+def create_json_download(chat_history):
+    """Create JSON format chat history"""
+    conversations = []
+    for item in chat_history:
+        if len(item) == 2:
+            role, message = item
+            source_pages = None
+        else:
+            role, message, source_pages = item
+        
+        conversations.append({
+            "role": role,
+            "message": message,
+            "sources": source_pages if role == "assistant" else None
+        })
+    
+    chat_data = {
+        "timestamp": datetime.now().isoformat(),
+        "conversation": conversations
+    }
+    return json.dumps(chat_data, indent=2, ensure_ascii=False)
+
+# -------------------- Custom CSS (Dark Theme) --------------------
+# -------------------- Custom CSS (Professional Subtle Dark Theme) --------------------
+def load_custom_css():
+    st.markdown("""
+    <style>
+    /* Professional Dark theme */
+    .stApp {
+        background: #1e1e1e;
+    }
+    
+    /* Header */
+    .main-header {
+        background: #ffffff;
+        padding: 35px;
+        border-radius: 12px;
+        text-align: center;
+        margin-bottom: 25px;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+        border-bottom: 2px solid #4a9eff;
+    }
+    
+    .main-header h1 {
+        color: #000000;
+        font-size: 2.5em;
+        font-weight: 700;
+        margin: 0;
+        letter-spacing: 1px;
+    }
+    
+    .main-header p {
+        color: #000000;
+        font-size: 1.1em;
+        margin: 10px 0 0 0;
+        font-weight: 400;
+    }
+    
+    /* Feature banner */
+    .feature-banner {
+        text-align: center;
+        padding: 12px;
+        background: #2d2d2d;
+        border-radius: 8px;
+        margin-bottom: 20px;
+        border: 1px solid #3a3a3a;
+    }
+    
+    .feature-banner p {
+        color: #b0b0b0;
+        font-size: 0.95em;
+        margin: 0;
+    }
+    
+    /* Chat messages */
+    .user-message {
+        background: #2d2d2d;
+        color: #e0e0e0;
+        padding: 18px;
+        border-radius: 12px 12px 4px 12px;
+        margin: 12px 0;
+        border-left: 3px solid #4a9eff;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    }
+    
+    .bot-message {
+        background: #252525;
+        color: #d0d0d0;
+        padding: 18px;
+        border-radius: 12px 12px 12px 4px;
+        margin: 12px 0;
+        border-left: 3px solid #6c63ff;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    }
+    
+    .page-reference {
+        display: inline-block;
+        background: #4a9eff;
+        color: white;
+        padding: 4px 12px;
+        border-radius: 12px;
+        font-size: 0.8em;
+        font-weight: 600;
+        margin: 8px 4px 0 0;
+        box-shadow: 0 2px 6px rgba(74,158,255,0.3);
+    }
+    
+    /* Buttons */
+    .stButton>button {
+        background: linear-gradient(135deg, #4a9eff 0%, #6c63ff 100%);
+        color: white;
+        border: none;
+        border-radius: 8px;
+        padding: 10px 24px;
+        font-weight: 600;
+        transition: all 0.3s;
+        box-shadow: 0 3px 10px rgba(74,158,255,0.3);
+    }
+    
+    .stButton>button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 5px 15px rgba(74,158,255,0.4);
+        background: linear-gradient(135deg, #5aa3ff 0%, #7d73ff 100%);
+    }
+    
+    /* Sidebar */
+    [data-testid="stSidebar"] {
+        background: #252525;
+        border-right: 1px solid #3a3a3a;
+    }
+    
+    [data-testid="stSidebar"] h3 {
+        color: #e0e0e0;
+    }
+    
+    [data-testid="stSidebar"] p, [data-testid="stSidebar"] label {
+        color: #b0b0b0;
+    }
+    
+    /* Success/Info boxes */
+    .stSuccess {
+        background-color: rgba(74,158,255,0.1);
+        border-left: 4px solid #4a9eff;
+        color: #4a9eff;
+        border-radius: 4px;
+    }
+    
+    .stInfo {
+        background-color: rgba(108,99,255,0.1);
+        border-left: 4px solid #6c63ff;
+        color: #6c63ff;
+        border-radius: 4px;
+    }
+    
+    .stWarning {
+        background-color: rgba(255,179,0,0.1);
+        border-left: 4px solid #ffb300;
+        color: #ffb300;
+        border-radius: 4px;
+    }
+    
+    .stError {
+        background-color: rgba(255,82,82,0.1);
+        border-left: 4px solid #ff5252;
+        color: #ff5252;
+        border-radius: 4px;
+    }
+    
+    /* File uploader */
+    [data-testid="stFileUploader"] {
+        background: #2d2d2d;
+        border: 2px dashed #4a9eff;
+        border-radius: 10px;
+        padding: 20px;
+    }
+    
+    [data-testid="stFileUploader"] label {
+        color: #b0b0b0;
+    }
+    
+    /* Input boxes */
+    .stTextInput>div>div>input {
+        background: #2d2d2d;
+        color: #e0e0e0;
+        border: 1px solid #4a4a4a;
+        border-radius: 8px;
+        padding: 10px;
+    }
+    
+    .stTextInput>div>div>input:focus {
+        border-color: #4a9eff;
+        box-shadow: 0 0 0 1px #4a9eff;
+    }
+    
+    /* Expander */
+    .streamlit-expanderHeader {
+        background: #2d2d2d;
+        border-radius: 8px;
+        color: #e0e0e0;
+        font-weight: 600;
+        border: 1px solid #3a3a3a;
+    }
+    
+    .streamlit-expanderHeader:hover {
+        background: #353535;
+        border-color: #4a9eff;
+    }
+    
+    /* Dataframe */
+    .stDataFrame {
+        background: #2d2d2d;
+        border-radius: 8px;
+    }
+    
+    /* Markdown text */
+    .stMarkdown {
+        color: #d0d0d0;
+    }
+    
+    /* Checkbox */
+    .stCheckbox {
+        color: #b0b0b0;
+    }
+    
+    /* Radio buttons */
+    .stRadio > label {
+        color: #e0e0e0;
+    }
+    
+    .stRadio > div {
+        color: #b0b0b0;
+    }
+    
+    /* Footer */
+    .footer {
+        text-align: center;
+        color: #808080;
+        padding: 25px;
+        margin-top: 40px;
+        border-top: 1px solid #3a3a3a;
+    }
+    
+    .footer h3 {
+        color: #e0e0e0;
+        margin-bottom: 15px;
+        font-size: 1.3em;
+    }
+    
+    .footer a {
+        color: #4a9eff;
+        text-decoration: none;
+        transition: color 0.3s;
+    }
+    
+    .footer a:hover {
+        color: #6c63ff;
+    }
+    
+    /* Scrollbar */
+    ::-webkit-scrollbar {
+        width: 10px;
+        height: 10px;
+    }
+    
+    ::-webkit-scrollbar-track {
+        background: #1e1e1e;
+    }
+    
+    ::-webkit-scrollbar-thumb {
+        background: #4a4a4a;
+        border-radius: 5px;
+    }
+    
+    ::-webkit-scrollbar-thumb:hover {
+        background: #5a5a5a;
+    }
+    
+    /* Divider */
+    hr {
+        border-color: #3a3a3a;
+    }
+    
+    /* Download buttons */
+    .stDownloadButton>button {
+        background: #2d2d2d;
+        color: #4a9eff;
+        border: 1px solid #4a9eff;
+        border-radius: 8px;
+        padding: 10px 20px;
+        font-weight: 600;
+        transition: all 0.3s;
+    }
+    
+    .stDownloadButton>button:hover {
+        background: #4a9eff;
+        color: white;
+        transform: translateY(-2px);
+    }
+    
+    /* Feature grid */
+    .feature-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 15px;
+        margin: 20px 0;
+    }
+    
+    .feature-card {
+        background: #2d2d2d;
+        padding: 15px;
+        border-radius: 8px;
+        border: 1px solid #3a3a3a;
+        transition: all 0.3s;
+    }
+    
+    .feature-card:hover {
+        border-color: #4a9eff;
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(74,158,255,0.2);
+    }
+    
+    .feature-card strong {
+        color: #4a9eff;
+        display: block;
+        margin-bottom: 5px;
+    }
+    
+    .feature-card span {
+        color: #909090;
+        font-size: 0.9em;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+# -------------------- Streamlit UI --------------------
+st.set_page_config(
+    page_title="IntelliDoc - AI Document Analysis",
+    page_icon="📄",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Load custom CSS
+load_custom_css()
+
+# Custom Header
+# Custom Header
+st.markdown("""
+<div class="main-header">
+    <h1>📄 IntelliDoc</h1>
+    <p>AI-Powered Multilingual Document Analysis System</p>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class="feature-banner">
+    <p>
+        ⚡ <strong>Features:</strong> Printed & Handwritten OCR | 10+ Languages | Real-Time Translation | 
+        Table Extraction | Chart Detection | Audio I/O | 3x Faster Processing
+    </p>
+</div>
+""", unsafe_allow_html=True)
+
+# Session state
+for key, val in [("chunks", []), ("meta", []), ("embeddings", None),
+                 ("faiss_index", None), ("full_text", ""), ("chat_history", []),
+                 ("file_info", {}), ("vectorizer", None), ("tables", []), 
+                 ("visuals", [])]:
+    if key not in st.session_state:
+        st.session_state[key] = val
+
+# Sidebar
+st.sidebar.markdown("### 📂 Document Upload")
+
+doc_mode = st.sidebar.radio(
+    "Processing Mode:",
+    ["🚀 Smart (Auto-detect)", "🔍 Force OCR (Scanned/Handwritten)"],
+    help="Smart mode automatically detects which pages need OCR"
+)
+
+uploaded_pdfs = st.sidebar.file_uploader(
+    "📑 PDF Files", 
+    type="pdf", 
+    accept_multiple_files=True,
+    key="pdf_uploader"
+)
+
+uploaded_images = st.sidebar.file_uploader(
+    "🖼️ Image Files", 
+    type=["jpg", "jpeg", "png", "bmp", "tiff"],
+    accept_multiple_files=True,
+    key="img_uploader"
+)
+
+st.sidebar.markdown("### ⚙️ Advanced Options")
+extract_tables = st.sidebar.checkbox("📊 Extract Tables", value=True)
+detect_visuals = st.sidebar.checkbox("📈 Detect Charts/Diagrams", value=True)
+
+process_btn = st.sidebar.button("🚀 Process Documents", type="primary", use_container_width=True)
+
+# Processing
+if process_btn:
+    # Clear previous data
+    for key in ["chunks", "meta", "embeddings", "faiss_index", "full_text", 
+                "file_info", "chat_history", "tables", "visuals"]:
+        if key in ["chunks", "meta", "file_info", "chat_history", "tables", "visuals"]:
+            st.session_state[key].clear()
+        else:
+            st.session_state[key] = None if key != "full_text" else ""
+    
+    force_ocr = ("Force OCR" in doc_mode)
+    total_start = time.time()
+    
+    with st.spinner("⚡ Processing documents with parallel OCR..."):
+        # Process PDFs
+        for pdf in uploaded_pdfs or []:
+            start_time = time.time()
+            st.info(f"📄 Processing: {pdf.name}")
+            pdf_bytes = pdf.read()
+            
+            # Extract tables
+            if extract_tables:
+                with st.spinner(f"📊 Extracting tables from {pdf.name}..."):
+                    tables = extract_tables_from_pdf(pdf_bytes, pdf.name)
+                    if tables:
+                        st.session_state.tables.extend(tables)
+                        st.success(f"✅ Found {len(tables)} table(s)")
+            
+            # Detect visuals
+            if detect_visuals:
+                with st.spinner(f"📈 Detecting charts/diagrams in {pdf.name}..."):
+                    visuals = detect_visual_elements(pdf_bytes, pdf.name)
+                    if visuals:
+                        st.session_state.visuals.extend(visuals)
+                        st.success(f"✅ Found {len(visuals)} visual element(s)")
+            
+            # Extract text
+            text, pages_processed, total_pages = extract_text_from_pdf_parallel(
+                pdf_bytes, pdf.name, force_ocr=force_ocr
+            )
+            
+            processing_time = time.time() - start_time
+            
+            if text:
+                st.session_state.full_text += f"\n\n=== FILE: {pdf.name} ===\n{text}"
+                ch, md = chunk_text_smart(text, pdf.name)
+                st.session_state.chunks.extend(ch)
+                st.session_state.meta.extend(md)
+                
+                st.session_state.file_info[pdf.name] = {
+                    'chars': len(text),
+                    'pages': total_pages,
+                    'time': processing_time
+                }
+                
+                speed = total_pages / processing_time if processing_time > 0 else 0
+                st.success(
+                    f"✅ {pdf.name}: {total_pages} pages in {processing_time:.1f}s "
+                    f"({speed:.1f} pages/sec)"
+                )
+            else:
+                st.warning(f"⚠️ Could not extract text from {pdf.name}")
+        
+        # Process Images
+        for img in uploaded_images or []:
+            start_time = time.time()
+            st.info(f"🖼️ Processing: {img.name}")
+            text = extract_text_from_image_fast(img)
+            processing_time = time.time() - start_time
+            
+            if text:
+              
+                st.session_state.full_text += f"\n\n=== IMAGE: {img.name} ===\n{text}"
+                ch, md = chunk_text_smart(text, img.name)
+                st.session_state.chunks.extend(ch)
+                st.session_state.meta.extend(md)
+                
+                st.session_state.file_info[img.name] = {
+                    'chars': len(text),
+                    'time': processing_time
+                }
+                st.success(f"✅ {img.name}: {len(text)} chars in {processing_time:.1f}s")
+            else:
+                st.warning(f"⚠️ Could not extract text from {img.name}")
+        
+        # Build embeddings
+        if st.session_state.chunks:
+            st.info(f"🔢 Creating search index for {len(st.session_state.chunks)} chunks...")
+            embed_start = time.time()
+            
+            emb_np, vectorizer = embed_texts_tfidf(st.session_state.chunks)
+            st.session_state.embeddings = emb_np
+            st.session_state.vectorizer = vectorizer
+            st.session_state.faiss_index = build_faiss_index(emb_np)
+            
+            embed_time = time.time() - embed_start
+            total_time = time.time() - total_start
+            
+            st.success(
+                f"✅ Search index created in {embed_time:.1f}s | "
+                f"Total: {total_time:.1f}s"
+            )
+            
+            # Show statistics
+            st.sidebar.markdown("### 📊 Processing Stats")
+            total_docs = len(st.session_state.file_info)
+            total_chunks = len(st.session_state.chunks)
+            st.sidebar.markdown(f"**Documents:** {total_docs} | **Chunks:** {total_chunks}")
+            
+            for fname, info in st.session_state.file_info.items():
+                if 'pages' in info:
+                    st.sidebar.text(f"📄 {fname[:25]}...: {info['pages']}p ({info['time']:.1f}s)")
+                else:
+                    st.sidebar.text(f"🖼️ {fname[:25]}...: ({info['time']:.1f}s)")
+            
+            if st.session_state.tables:
+                st.sidebar.markdown(f"**Tables Found:** {len(st.session_state.tables)}")
+            
+            if st.session_state.visuals:
+                st.sidebar.markdown(f"**Visuals Found:** {len(st.session_state.visuals)}")
+        else:
+            st.error("❌ No text extracted. Check file quality and OCR settings.")
+
+# Display extracted tables
+if st.session_state.tables:
+    with st.expander(f"📊 Extracted Tables ({len(st.session_state.tables)} found)", expanded=False):
+        for table_info in st.session_state.tables:
+            st.markdown(f"**📄 {table_info['doc']} - Page {table_info['page']}, Table {table_info['table_num']}**")
+            st.dataframe(table_info['data'], use_container_width=True)
+            st.markdown("---")
+
+# Display detected visuals
+if st.session_state.visuals:
+    with st.expander(f"📈 Detected Charts & Diagrams ({len(st.session_state.visuals)} found)", expanded=False):
+        cols = st.columns(3)
+        for idx, visual in enumerate(st.session_state.visuals):
+            col = cols[idx % 3]
+            with col:
+                st.image(visual['image'], caption=f"{visual['doc']} - Page {visual['page']}\n{visual['type']}", use_container_width=True)
+
+# Chat Interface
+st.markdown("---")
+st.markdown("### 💬 Chat with Your Documents")
+
+if not st.session_state.faiss_index:
+    st.info("👆 Upload and process documents using the sidebar first.")
+else:
+    # Audio input section
+    with st.expander("🎤 Voice Input (Optional)", expanded=False):
+        get_audio_input()
+    
+    # Text input
+    user_input = st.text_input(
+        "Your question:",
+        placeholder="E.g., 'Summarize in Kannada', 'What dates are mentioned?', 'Translate to Hindi'",
+        key="user_question"
+    )
+    
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        ask_button = st.button("📤 Send Question", type="primary", use_container_width=True)
+    with col2:
+        audio_output = st.checkbox("🔊 Audio", value=False)
+    
+    with st.expander("💡 Example Questions", expanded=False):
+        st.markdown("""
+        **General Queries:**
+        - "Summarize this document in Kannada"
+        - "What is the main topic?"
+        - "List all important dates mentioned"
+        - "Explain this pdf in kannada"
+        - "Give brief information ?"
+        - "What content if given in the pdf?"
+                    
+        
+        **Translation:**
+        - "Translate the main points to Telugu"
+        - "Convert this to Hindi"
+        
+        **Specific Information:**
+        - "What are the names of people mentioned?"
+        - "Extract all numerical values"
+        - "What tables are present?"
+        """)
+    
+    if ask_button and user_input:
+        st.session_state.chat_history.append(("user", user_input))
+        
+        with st.spinner("🤔 Analyzing..."):
+            is_summary = any(kw in user_input.lower() for kw in 
+                           ["summary", "summarize", "overview", "brief", "main points"])
+            
+            target_lang = extract_target_language(user_input)
+            if not target_lang:
+                target_lang = detect_question_language(user_input)
+            
+            if is_summary:
+                answer = summarize_document(st.session_state.full_text, target_lang)
+                source_pages = "Summary from entire document"
+            else:
+                qvec, _ = embed_texts_tfidf(
+                    [user_input], 
+                    vectorizer=st.session_state.vectorizer
+                )
+                qvec = qvec.astype("float32")
+                
+                norm = np.linalg.norm(qvec)
+                if norm > 0:
+                    qvec = qvec / norm
+                
+                D, I = st.session_state.faiss_index.search(qvec, TOP_K)
+                
+                if len(D[0]) == 0 or D[0][0] < SIMILARITY_THRESHOLD:
+                    answer = "I cannot find relevant information in the documents."
+                    source_pages = "N/A"
+                else:
+                    context_pieces = []
+                    total_chars = 0
+                    source_pages_set = set()
+                    
+                    for idx, score in zip(I[0], D[0]):
+                        if idx >= len(st.session_state.chunks):
+                            continue
+                        
+                        chunk = st.session_state.chunks[idx]
+                        source = st.session_state.meta[idx]['source']
+                        page = st.session_state.meta[idx].get('page', '?')
+                        
+                        if page and page != '?':
+                            source_pages_set.add(f"Page {page}")
+                        
+                        piece = f"[Source: {source}, Page: {page}]\n{chunk}"
+                        
+                        if total_chars + len(piece) > MAX_CONTEXT_CHARS:
+                            break
+                        
+                        context_pieces.append(piece)
+                        total_chars += len(piece)
+                    
+                    context = "\n\n---\n\n".join(context_pieces)
+                    answer = ask_groq_with_context(context, user_input, target_lang)
+                    
+                    # Sort pages numerically
+                    try:
+                        sorted_pages = sorted(source_pages_set, key=lambda x: int(re.findall(r'\d+', x)[0]))
+                        source_pages = " | ".join(sorted_pages) if sorted_pages else "N/A"
+                    except:
+                        source_pages = " | ".join(sorted(source_pages_set)) if source_pages_set else "N/A"
+            
+            # Add answer with source pages
+            st.session_state.chat_history.append(("assistant", answer, source_pages))
+            
+            # Audio output if enabled
+            if audio_output and answer:
+                with st.spinner("🔊 Generating audio..."):
+                    text_to_speech_button(answer, lang=target_lang)
+    
+    # Display chat with custom styling
+    st.markdown("### 📜 Conversation History")
+    
+    if not st.session_state.chat_history:
+        st.info("💭 No conversation yet. Ask your first question above!")
+    
+    for item in st.session_state.chat_history:
+        if len(item) == 2:
+            role, message = item
+            source_pages = None
+        else:
+            role, message, source_pages = item
+        
+        if role == "user":
+            st.markdown(
+                f'<div class="user-message"><strong>👤 You:</strong><br><br>{message}</div>', 
+                unsafe_allow_html=True
+            )
+        else:
+            page_badges = ""
+            if source_pages and source_pages not in ["N/A", "Summary from entire document"]:
+                for page in source_pages.split(" | "):
+                    page_badges += f'<span class="page-reference">📄 {page}</span>'
+            elif source_pages == "Summary from entire document":
+                page_badges = '<span class="page-reference">📄 Full Document</span>'
+            
+            st.markdown(
+                f'<div class="bot-message"><strong>🤖 IntelliDoc:</strong><br>{page_badges}<br><br>{message}</div>', 
+                unsafe_allow_html=True
+            )
+        st.markdown("<br>", unsafe_allow_html=True)
+    
+    # Download and Clear buttons
+    if st.session_state.chat_history:
+        st.markdown("---")
+        col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
+        
+        with col1:
+            chat_txt = create_chat_download(st.session_state.chat_history)
+            st.download_button(
+                label="📥 Download TXT",
+                data=chat_txt,
+                file_name=f"intellidoc_chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                mime="text/plain",
+                use_container_width=True
+            )
+        
+        with col2:
+            chat_json = create_json_download(st.session_state.chat_history)
+            st.download_button(
+                label="📥 Download JSON",
+                data=chat_json,
+                file_name=f"intellidoc_chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+                use_container_width=True
+            )
+        
+        with col3:
+            # Download full extracted text
+            st.download_button(
+                label="📄 Extracted Text",
+                data=st.session_state.full_text,
+                file_name=f"extracted_text_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                mime="text/plain",
+                use_container_width=True
+            )
+        
+        with col4:
+            if st.button("🗑️ Clear Chat", use_container_width=True):
+                st.session_state.chat_history.clear()
+                st.rerun()
+
+# Footer
+# Footer
+st.markdown("---")
+st.markdown("""
+<div class="footer">
+    <h3>⚡ Performance & Features</h3>
+    <div class="feature-grid">
+        <div class="feature-card">
+            <strong>🚀 Smart OCR</strong>
+            <span>Auto-detects when to use OCR</span>
+        </div>
+        <div class="feature-card">
+            <strong>⚡ 3x Faster</strong>
+            <span>Parallel processing</span>
+        </div>
+        <div class="feature-card">
+            <strong>🌐 10+ Languages</strong>
+            <span>Multilingual support</span>
+        </div>
+        <div class="feature-card">
+            <strong>📊 Smart Tables</strong>
+            <span>Automatic extraction</span>
+        </div>
+        <div class="feature-card">
+            <strong>📈 Chart Detection</strong>
+            <span>Visual element recognition</span>
+        </div>
+        <div class="feature-card">
+            <strong>🔊 Audio I/O</strong>
+            <span>Voice input & output</span>
+        </div>
+    </div>
+    <p style="margin-top: 20px; font-size: 0.9em;">
+        <strong>IntelliDoc</strong> v1.0 | Built with Streamlit, PyMuPDF, Tesseract OCR, FAISS & Groq LLM<br>
+        Supporting: English, Kannada, Hindi, Tamil, Telugu, Marathi, Malayalam, Gujarati, Bengali, Punjabi
+    </p>
+</div>
+""", unsafe_allow_html=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+# # app.py — IntelliDoc ULTRA-FAST Version (Speed Optimized)
 # import os
-# import tempfile
 # import streamlit as st
 # from dotenv import load_dotenv
 # import fitz  # PyMuPDF
-# from pdf2image import convert_from_bytes
 # from PIL import Image
 # import pytesseract
-# import easyocr
-# from sentence_transformers import SentenceTransformer
 # import numpy as np
 # import faiss
 # from groq import Groq
-# from langdetect import detect, DetectorFactory
+# from langdetect import detect, DetectorFactory, LangDetectException
+# from sklearn.feature_extraction.text import TfidfVectorizer
+# from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+# import time
+# import io
+# import json
+# from datetime import datetime
+# import pandas as pd
+# import cv2
+# import re
+# from typing import List, Dict, Tuple, Optional
+# import logging
+# from functools import lru_cache
+# import hashlib
+# import multiprocessing as mp
+# from queue import Queue
+# import threading
 
-# # make langdetect deterministic
 # DetectorFactory.seed = 0
 
-# # -------------------- Load env/config --------------------
+# # -------------------- SPEED-OPTIMIZED Configuration --------------------
+# logging.basicConfig(level=logging.WARNING)  # Reduced logging overhead
+# logger = logging.getLogger(__name__)
+
 # load_dotenv()
 # GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 # TESSERACT_CMD = os.getenv("TESSERACT_CMD", r"C:\Program Files\Tesseract-OCR\tesseract.exe")
-# TESSDATA_PREFIX = os.getenv("TESSDATA_PREFIX")  # optional
-# POPPLER_PATH = os.getenv("POPPLER_PATH")        # optional for pdf2image on Windows
 
-# # configure Tesseract path if provided
 # pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
-# if TESSDATA_PREFIX:
-#     os.environ["TESSDATA_PREFIX"] = TESSDATA_PREFIX
 
-# # -------------------- Config knobs --------------------
-# OCR_LANG_LIST = ["en","kn","hi","ta","te","mr","ml","gu","bn","pa"]  # used by EasyOCR reader
-# OCR_LANGS_TESSERACT = "+".join(["eng","kan","hin","tam","tel","mar","mal","guj","ben","pan"])  # for pytesseract
-# EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-# EMBED_BATCH = 64
-# TOP_K = 5
-# SIMILARITY_THRESHOLD = 0.20
-# SUMMARY_CHUNK_CHARS = 2500
-# MAX_CONTEXT_CHARS = 3500
-# SUMMARIES_TO_COMBINE = 6
+# # SPEED OPTIMIZATIONS
+# OCR_LANGS = "eng+kan+hin"  # Reduced languages for speed
+# TOP_K = 15  # Reduced from 25
+# SIMILARITY_THRESHOLD = 0.02  # Slightly lower for faster filtering
+# CHUNK_SIZE = 2000  # Reduced for faster processing
+# CHUNK_OVERLAP = 400  # Reduced overlap
+# MAX_CONTEXT_CHARS = 12000  # Reduced context size
+# MAX_WORKERS = min(16, mp.cpu_count() * 2)  # Aggressive parallelization
+# MAX_OUTPUT_TOKENS = 3000  # Reduced token generation
+# CACHE_SIZE = 512  # Increased cache
 
-# # -------------------- Initialize models & clients --------------------
+# # Use faster Groq model
+# FAST_MODEL = "llama-3.1-70b-versatile"  # Faster than 3.3
+
 # groq_client = Groq(api_key=GROQ_API_KEY)
-# embedder = SentenceTransformer(EMBED_MODEL)
 
-# # try to create EasyOCR reader (some platforms may need GPU disabled)
-# try:
-#     easyocr_reader = easyocr.Reader(OCR_LANG_LIST, gpu=False)
-# except Exception:
-#     easyocr_reader = None
+# # -------------------- ULTRA-FAST CACHING SYSTEM --------------------
+# class SpeedCache:
+#     """Lightning-fast in-memory cache with LRU eviction"""
+#     def __init__(self, maxsize=CACHE_SIZE):
+#         self.cache = {}
+#         self.access_times = {}
+#         self.maxsize = maxsize
+#         self.lock = threading.Lock()
+    
+#     def get(self, key: str):
+#         with self.lock:
+#             if key in self.cache:
+#                 self.access_times[key] = time.time()
+#                 return self.cache[key]
+#             return None
+    
+#     def set(self, key: str, value):
+#         with self.lock:
+#             if len(self.cache) >= self.maxsize:
+#                 # Remove oldest accessed item
+#                 oldest = min(self.access_times.items(), key=lambda x: x[1])[0]
+#                 del self.cache[oldest]
+#                 del self.access_times[oldest]
+            
+#             self.cache[key] = value
+#             self.access_times[key] = time.time()
+    
+#     def clear(self):
+#         with self.lock:
+#             self.cache.clear()
+#             self.access_times.clear()
 
-# # -------------------- Helper functions: extraction --------------------
-# def extract_text_with_pymupdf_bytes(pdf_bytes):
-#     """Extract text from PDF if it contains embedded text (fast & preferred)."""
-#     text = ""
-#     try:
-#         pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
-#         for pageno, page in enumerate(pdf, start=1):
-#             page_text = page.get_text("text")
-#             if page_text and page_text.strip():
-#                 text += f"\n\n[Page {pageno}]\n" + page_text
-#     except Exception:
-#         return ""
-#     return text.strip()
+# # Global caches
+# ocr_cache = SpeedCache(maxsize=1000)
+# embedding_cache = SpeedCache(maxsize=500)
+# text_cache = SpeedCache(maxsize=200)
 
-# def extract_text_with_easyocr_bytes(pdf_bytes):
-#     """Convert PDF to images and run EasyOCR on each page. Returns concatenated text."""
-#     text = ""
-#     convert_kwargs = {}
-#     if POPPLER_PATH:
-#         convert_kwargs["poppler_path"] = POPPLER_PATH
-#     try:
-#         images = convert_from_bytes(pdf_bytes, **convert_kwargs)
-#     except Exception:
-#         return ""
-#     for i, img in enumerate(images, start=1):
-#         try:
-#             if easyocr_reader:
-#                 results = easyocr_reader.readtext(np.asarray(img), detail=0)
-#                 page_text = "\n".join(results).strip()
-#             else:
-#                 page_text = ""
-#         except Exception:
-#             page_text = ""
-#         if not page_text:
-#             # fallback to pytesseract on this image
-#             try:
-#                 page_text = pytesseract.image_to_string(img, lang=OCR_LANGS_TESSERACT)
-#             except Exception:
-#                 page_text = ""
-#         if page_text and page_text.strip():
-#             text += f"\n\n[Page {i}]\n" + page_text
-#     return text.strip()
-
-# def extract_text_with_tesseract_bytes(pdf_bytes):
-#     """Fallback: convert PDF to images then use pytesseract."""
-#     text = ""
-#     convert_kwargs = {}
-#     if POPPLER_PATH:
-#         convert_kwargs["poppler_path"] = POPPLER_PATH
-#     try:
-#         images = convert_from_bytes(pdf_bytes, **convert_kwargs)
-#     except Exception:
-#         return ""
-#     for i, img in enumerate(images, start=1):
-#         try:
-#             page_text = pytesseract.image_to_string(img, lang=OCR_LANGS_TESSERACT)
-#         except Exception:
-#             page_text = ""
-#         if page_text and page_text.strip():
-#             text += f"\n\n[Page {i}]\n" + page_text
-#     return text.strip()
-
-# def extract_text_from_pdf_file(file_obj):
-#     """Try PyMuPDF first; if insufficient, try EasyOCR -> pytesseract."""
-#     pdf_bytes = file_obj.read()
-#     # try text extraction first
-#     text = extract_text_with_pymupdf_bytes(pdf_bytes)
-#     if len(text.strip()) >= 60:
-#         return text
-#     # try EasyOCR (preferred for scanned regional languages)
-#     text_eo = extract_text_with_easyocr_bytes(pdf_bytes)
-#     if len(text_eo.strip()) >= 40:
-#         return text_eo
-#     # fallback to pytesseract
-#     text_t = extract_text_with_tesseract_bytes(pdf_bytes)
-#     return text_t or ""
-
-# def extract_text_from_image_file(image_file):
-#     """OCR an image file using EasyOCR primary, then pytesseract fallback."""
-#     try:
-#         img = Image.open(image_file)
-#     except Exception:
-#         return ""
-#     page_text = ""
-#     if easyocr_reader:
-#         try:
-#             results = easyocr_reader.readtext(np.asarray(img), detail=0)
-#             page_text = "\n".join(results).strip()
-#         except Exception:
-#             page_text = ""
-#     if not page_text:
-#         try:
-#             page_text = pytesseract.image_to_string(img, lang=OCR_LANGS_TESSERACT)
-#         except Exception:
-#             page_text = ""
-#     return page_text or ""
-
-# # -------------------- Helpers: chunking & embeddings --------------------
-# def chunk_text_keep_meta(text, source_name, chunk_chars=2000, overlap_chars=300):
-#     if not text:
-#         return [], []
-#     chunks, metas = [], []
-#     start = 0
-#     L = len(text)
-#     while start < L:
-#         end = start + chunk_chars
-#         chunk = text[start:end].strip()
-#         if chunk:
-#             chunks.append(chunk)
-#             metas.append({"source": source_name})
-#         start += chunk_chars - overlap_chars
-#     return chunks, metas
-
-# def embed_texts_in_batches(texts):
-#     if not texts:
-#         return np.zeros((0, embedder.get_sentence_embedding_dimension()), dtype="float32")
-#     vectors = embedder.encode(texts, convert_to_numpy=True, show_progress_bar=False, batch_size=EMBED_BATCH)
-#     return np.asarray(vectors, dtype="float32")
-
-# def build_faiss_index(emb_np):
-#     if emb_np is None or emb_np.shape[0] == 0:
-#         raise ValueError("Empty embeddings")
-#     faiss.normalize_L2(emb_np)
-#     dim = emb_np.shape[1]
-#     idx = faiss.IndexFlatIP(dim)
-#     idx.add(emb_np.astype("float32"))
-#     return idx
-
-# # -------------------- Helpers: Groq calls & summarization --------------------
-# LANG_MAP = {
-#     "kn":"Kannada","hi":"Hindi","ta":"Tamil","te":"Telugu","mr":"Marathi",
-#     "ml":"Malayalam","gu":"Gujarati","bn":"Bengali","pa":"Punjabi","en":"English"
-# }
-
-# def ask_groq_with_context(context, question, lang_code="en", require_quotes=True, highlights=False, max_tokens=700):
-#     lang_name = LANG_MAP.get(lang_code, "the same language as the question")
-#     quote_instr = "When giving numeric/date/name facts, quote the exact excerpt from CONTEXT and include source." if require_quotes else ""
-#     highlight_instr = "Also provide key highlights and bullet-list important parts." if highlights else ""
-#     prompt = f"""
-# You are a careful PDF-QA assistant. Use ONLY the CONTEXT below to answer the QUESTION. Do NOT invent facts.
-# If the answer cannot be found in the CONTEXT, reply exactly: "This question is not related to the uploaded PDF."
-# Answer concisely in {lang_name}.
-
-# {quote_instr}
-# {highlight_instr}
-
-# --- CONTEXT START ---
-# {context}
-# --- CONTEXT END ---
-
-# QUESTION:
-# {question}
-
-# Answer:
-# """
-#     try:
-#         resp = groq_client.chat.completions.create(
-#             model="llama-3.1-8b-instant",
-#             messages=[{"role":"user","content": prompt}],
-#             temperature=0.0,
-#             max_tokens=max_tokens
+# # -------------------- ULTRA-FAST OCR ENGINE --------------------
+# class TurboOCR:
+#     """Optimized OCR with aggressive caching and minimal preprocessing"""
+    
+#     @staticmethod
+#     def _fast_preprocess(img_array: np.ndarray) -> np.ndarray:
+#         """Single-pass optimized preprocessing"""
+#         if len(img_array.shape) == 3:
+#             gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+#         else:
+#             gray = img_array
+        
+#         # Fast adaptive threshold (fastest method)
+#         binary = cv2.adaptiveThreshold(
+#             gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+#             cv2.THRESH_BINARY, 11, 2
 #         )
-#         return resp.choices[0].message.content.strip()
+#         return binary
+    
+#     @staticmethod
+#     def fast_ocr(image: Image.Image, lang: str = OCR_LANGS) -> str:
+#         """Ultra-fast OCR with caching"""
+#         # Generate cache key
+#         img_bytes = image.tobytes()
+#         cache_key = hashlib.md5(img_bytes).hexdigest()
+        
+#         # Check cache
+#         cached = ocr_cache.get(cache_key)
+#         if cached:
+#             return cached
+        
+#         # Fast preprocessing
+#         img_array = np.array(image)
+#         processed = TurboOCR._fast_preprocess(img_array)
+        
+#         # Single OCR pass with optimal config
+#         config = '--psm 6 --oem 3'  # Fastest reliable config
+        
+#         try:
+#             text = pytesseract.image_to_string(processed, lang=lang, config=config)
+#             result = text.strip()
+            
+#             # Cache result
+#             ocr_cache.set(cache_key, result)
+#             return result
+#         except:
+#             return ""
+
+# turbo_ocr = TurboOCR()
+
+# # -------------------- PARALLEL PDF PROCESSING --------------------
+# def process_single_page_fast(args: Tuple) -> Dict:
+#     """Ultra-fast single page processing"""
+#     page_data, page_num, doc_name, force_ocr = args
+    
+#     try:
+#         # Try text extraction first (fastest)
+#         if not force_ocr:
+#             text = page_data.get_text("text")
+#             if len(text.strip()) > 30:
+#                 return {
+#                     'page': page_num,
+#                     'text': text.strip(),
+#                     'doc': doc_name,
+#                     'success': True
+#                 }
+        
+#         # Fast OCR fallback
+#         mat = fitz.Matrix(2.0, 2.0)  # Reduced from 4.0 for speed
+#         pix = page_data.get_pixmap(matrix=mat, alpha=False)
+#         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        
+#         text = turbo_ocr.fast_ocr(img)
+        
+#         return {
+#             'page': page_num,
+#             'text': text,
+#             'doc': doc_name,
+#             'success': True
+#         }
 #     except Exception as e:
-#         # bubble up friendly message
-#         return f"LLM error: {getattr(e,'args',e)}"
+#         logger.debug(f"Page {page_num} failed: {e}")
+#         return {'success': False}
 
-# def summarize_large_text_iteratively(full_text, lang_code="en"):
-#     if not full_text or len(full_text.strip()) < 30:
-#         return "No extractable text to summarize from the uploaded documents."
-#     # split into char chunks
-#     parts = []
-#     L = len(full_text)
-#     step = SUMMARY_CHUNK_CHARS
-#     overlap = 400
-#     i = 0
-#     while i < L:
-#         parts.append(full_text[i:i+step])
-#         i += step - overlap
-
-#     # summarize each part
-#     part_summaries = []
-#     for p in parts:
-#         prompt = f"Summarize this passage in up to 200 words in {LANG_MAP.get(lang_code,'the same language')}. Do NOT add facts.\n\nPassage:\n{p}\n\nSummary:"
-#         try:
-#             resp = groq_client.chat.completions.create(
-#                 model="llama-3.1-8b-instant",
-#                 messages=[{"role":"user","content": prompt}],
-#                 max_tokens=350,
-#                 temperature=0.0
-#             )
-#             s = resp.choices[0].message.content.strip()
-#         except Exception:
-#             s = ""
-#         if s:
-#             part_summaries.append(s)
-
-#     # combine groups to avoid huge payloads
-#     while len(part_summaries) > SUMMARIES_TO_COMBINE:
-#         new_summaries = []
-#         for j in range(0, len(part_summaries), SUMMARIES_TO_COMBINE):
-#             group = "\n\n".join(part_summaries[j:j+SUMMARIES_TO_COMBINE])
-#             prompt = f"Combine and condense these summaries into one concise summary (max 200 words):\n\n{group}\n\nCombined summary:"
-#             try:
-#                 resp = groq_client.chat.completions.create(
-#                     model="llama-3.1-8b-instant",
-#                     messages=[{"role":"user","content": prompt}],
-#                     max_tokens=400,
-#                     temperature=0.0
-#                 )
-#                 ns = resp.choices[0].message.content.strip()
-#             except Exception:
-#                 ns = ""
-#             if ns:
-#                 new_summaries.append(ns)
-#         part_summaries = new_summaries
-
-#     # final combine
-#     final_text = "\n\n".join(part_summaries)
-#     prompt = f"Produce a final formal summary (3-6 short sentences) and then a brief friendly summary for a general user. Text:\n\n{final_text}\n\nOutput:"
+# def extract_text_from_pdf_turbo(pdf_bytes: bytes, doc_name: str, 
+#                                 force_ocr: bool = False) -> Tuple[str, int, int]:
+#     """ULTRA-FAST parallel PDF processing"""
+    
+#     # Check cache
+#     cache_key = f"pdf_{hashlib.md5(pdf_bytes).hexdigest()}"
+#     cached = text_cache.get(cache_key)
+#     if cached:
+#         return cached
+    
 #     try:
-#         resp = groq_client.chat.completions.create(
-#             model="llama-3.1-8b-instant",
-#             messages=[{"role":"user","content": prompt}],
-#             max_tokens=600,
-#             temperature=0.0
-#         )
-#         return resp.choices[0].message.content.strip()
-#     except Exception:
-#         return "Sorry — the LLM couldn't produce a final summary."
+#         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+#         total_pages = len(doc)
+        
+#         # Prepare all pages
+#         page_args = [(doc[i], i+1, doc_name, force_ocr) for i in range(total_pages)]
+        
+#         results = []
+        
+#         # Use ProcessPoolExecutor for true parallel processing
+#         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+#             futures = [executor.submit(process_single_page_fast, args) for args in page_args]
+            
+#             for future in as_completed(futures):
+#                 result = future.result()
+#                 if result.get('success'):
+#                     results.append(result)
+        
+#         doc.close()
+        
+#         # Sort by page number
+#         results.sort(key=lambda x: x['page'])
+        
+#         # Combine text
+#         full_text = "\n\n".join([f"[Page {r['page']}]\n{r['text']}" for r in results])
+        
+#         result_tuple = (full_text, len(results), total_pages)
+        
+#         # Cache result
+#         text_cache.set(cache_key, result_tuple)
+        
+#         return result_tuple
+    
+#     except Exception as e:
+#         logger.error(f"PDF processing error: {e}")
+#         return "", 0, 0
 
-# # -------------------- Streamlit UI --------------------
-# st.set_page_config(page_title="Multilingual PDF Chatbot", page_icon="📚", layout="wide")
-# st.title("📄 Multilingual PDF Chatbot — EasyOCR + Tesseract fallback + FAISS + Groq")
-# st.markdown("**Hello!** I can read uploaded PDFs or images (scanned or text) in many Indian languages and answer or summarize based ONLY on the documents. How can I assist you today?")
-
-# # session state defaults
-# if "chunks" not in st.session_state:
-#     st.session_state.chunks = []
-# if "meta" not in st.session_state:
-#     st.session_state.meta = []
-# if "embeddings" not in st.session_state:
-#     st.session_state.embeddings = None
-# if "faiss_index" not in st.session_state:
-#     st.session_state.faiss_index = None
-# if "full_text" not in st.session_state:
-#     st.session_state.full_text = ""
-# if "chat_history" not in st.session_state:
-#     st.session_state.chat_history = []
-
-# # Sidebar: uploads
-# st.sidebar.header("Upload PDFs or images")
-# uploaded_pdfs = st.sidebar.file_uploader("Upload PDF files (one or more)", accept_multiple_files=True, type=["pdf"])
-# uploaded_images = st.sidebar.file_uploader("Upload scanned images (jpg/png/jpeg) — optional", accept_multiple_files=True, type=["png","jpg","jpeg"])
-# process_btn = st.sidebar.button("Process uploads")
-
-# if process_btn:
-#     # reset
-#     st.session_state.chunks = []
-#     st.session_state.meta = []
-#     st.session_state.embeddings = None
-#     st.session_state.faiss_index = None
-#     st.session_state.full_text = ""
-#     st.success("Started processing uploads — OCR & embeddings may take a moment.")
-
-#     # process PDFs
-#     for pdf in uploaded_pdfs or []:
-#         st.sidebar.write(f"Processing PDF: {pdf.name}")
-#         text = extract_text_from_pdf_file(pdf)
-#         if not text or len(text.strip()) < 20:
-#             st.sidebar.write(f" → Very little text extracted from {pdf.name}.")
-#         st.session_state.full_text += f"\n\n[File: {pdf.name}]\n" + (text or "")
-#         ch, md = chunk_text_keep_meta(text or "", source_name=pdf.name)
-#         for c,m in zip(ch, md):
-#             st.session_state.chunks.append(c)
-#             st.session_state.meta.append(m)
-
-#     # images (optional)
-#     for imgf in uploaded_images or []:
-#         st.sidebar.write(f"Processing Image: {imgf.name}")
-#         txt = extract_text_from_image_file(imgf)
-#         st.session_state.full_text += f"\n\n[Image: {imgf.name}]\n" + (txt or "")
-#         ch, md = chunk_text_keep_meta(txt or "", source_name=imgf.name)
-#         for c,m in zip(ch, md):
-#             st.session_state.chunks.append(c)
-#             st.session_state.meta.append(m)
-
-#     # build embeddings and faiss (if chunks exist)
-#     if st.session_state.chunks:
-#         st.sidebar.info("Computing embeddings (this can take a while for many chunks)...")
-#         emb_np = embed_texts_in_batches(st.session_state.chunks)
-#         if emb_np.shape[0] == 0:
-#             st.sidebar.error("Embeddings failed. No vectors produced.")
-#         else:
-#             st.session_state.embeddings = emb_np
-#             st.session_state.faiss_index = build_faiss_index(emb_np.copy())
-#             st.sidebar.success(f"Vector store created with {emb_np.shape[0]} chunks.")
-#     else:
-#         st.sidebar.warning("No chunks extracted. Try clearer scans or ensure tessdata/EasyOCR support installed.")
-
-# st.markdown("---")
-# st.subheader("Chat — ask questions about the uploaded documents")
-
-# if not st.session_state.faiss_index:
-#     st.info("Please upload & process PDFs/images (sidebar) to enable chat.")
-# else:
-#     # use text_input with a key; on_click handler will process and clear
-#     if "question_input" not in st.session_state:
-#         st.session_state.question_input = ""
-
-#     def on_ask():
-#         q = st.session_state.get("question_input", "").strip()
-#         if not q:
-#             return
-#         st.session_state.chat_history.append(("user", q))
-#         # detect language
-#         try:
-#             user_lang = detect(q)
-#         except Exception:
-#             user_lang = "en"
-
-#         # determine if user asked for a broad explanation / summary
-#         q_lower = q.lower()
-#         summary_triggers = ["explain", "summary", "what is in", "what's in", "brief", "give an overview",
-#                             "describe this document", "what does this pdf say", "explain this pdf",
-#                             "tell me about this pdf", "what information", "summarize"]
-#         is_summary = any(t in q_lower for t in summary_triggers)
-
-#         if is_summary:
-#             full_txt = st.session_state.full_text
-#             if not full_txt or len(full_txt.strip()) < 20:
-#                 bot_ans = "I couldn't find substantial text to summarize from the uploaded documents. Try clearer scans or ensure language packs are installed."
-#             else:
-#                 bot_ans = summarize_large_text_iteratively(full_txt, lang_code=user_lang)
-#         else:
-#             # QA flow: embed question, search top chunks
-#             qvec = embedder.encode([q], convert_to_numpy=True).astype("float32")
-#             faiss.normalize_L2(qvec)
-#             D, I = st.session_state.faiss_index.search(qvec, TOP_K)
-#             top_scores = D[0] if D.shape[0] else []
-#             top_idx = I[0] if I.shape[0] else []
-
-#             if len(top_scores) == 0 or top_scores[0] < SIMILARITY_THRESHOLD:
-#                 # If retrieval low, we still offer a summarized explanation if user explicitly asked earlier,
-#                 # but for general QA we must avoid hallucination.
-#                 bot_ans = "This question is not related to the uploaded PDF."
-#             else:
-#                 # assemble limited context (respect MAX_CONTEXT_CHARS to avoid payload errors)
-#                 pieces = []
-#                 total_chars = 0
-#                 for idx in top_idx:
-#                     if idx >= len(st.session_state.chunks):
-#                         continue
-#                     md = st.session_state.meta[idx]
-#                     chunk = st.session_state.chunks[idx]
-#                     piece = f"[Source: {md.get('source','unknown')}]\n{chunk}"
-#                     if total_chars + len(piece) > MAX_CONTEXT_CHARS:
-#                         break
-#                     pieces.append(piece)
-#                     total_chars += len(piece)
-#                 context = "\n\n---\n\n".join(pieces)
-#                 # call Groq with context
-#                 bot_ans = ask_groq_with_context(context, q, lang_code=user_lang, require_quotes=True, highlights=False)
-
-#         st.session_state.chat_history.append(("bot", bot_ans))
-#         # clear the input for next queries safely inside the callback
-#         st.session_state["question_input"] = ""
-
-#     st.text_input("Ask your question (any language):", key="question_input")
-#     st.button("Ask", on_click=on_ask)
-
-#     # show history
-#     st.markdown("### Conversation")
-#     for role, text in st.session_state.chat_history:
-#         if role == "user":
-#             st.markdown(f"**You:** {text}")
-#         else:
-#             st.markdown(f"**Bot:** {text}")
-#         st.markdown("---")
-
-# st.markdown(
-#     """
-# **Tips & Notes**
-# - EasyOCR generally gives better results for Indic scripts (Kannada/Tamil/Telugu/Malayalam etc.). If you get poor OCR, try higher-resolution (300 DPI) scans.
-# - If Groq returns token/payload errors for very large documents, use the summary/explain request which triggers iterative summarization.
-# - Tune SIMILARITY_THRESHOLD, MAX_CONTEXT_CHARS and SUMMARY_CHUNK_CHARS near the top of this file for your setup.
-# - You can add/remove languages by editing OCR_LANG_LIST and OCR_LANGS_TESSERACT.
-# """
-# )
-
-
-
-#========================================================================================================================
-# #1
-
-
-# # app.py — Multilingual PDF Chatbot (Groq + FAISS + OCR + iterative summarization)
-# import os
-# import math
-# import tempfile
-# import streamlit as st
-# from dotenv import load_dotenv
-# import fitz  # PyMuPDF
-# from pdf2image import convert_from_bytes
-# from PIL import Image
-# import pytesseract
-
-# from sentence_transformers import SentenceTransformer
-# import numpy as np
-# import faiss
-# from groq import Groq
-
-# from langdetect import detect, DetectorFactory
-# DetectorFactory.seed = 0
-
-
-
-# # -------------------- Load ENV --------------------
-# load_dotenv()
-# GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-# TESSERACT_CMD = os.getenv("TESSERACT_CMD", r"C:\Program Files\Tesseract-OCR\tesseract.exe")
-# TESSDATA_PREFIX = os.getenv("TESSDATA_PREFIX")  # optional
-# POPPLER_PATH = os.getenv("POPPLER_PATH")        # optional (pdf2image on Windows)
-
-# # configure tesseract
-# pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
-# if TESSDATA_PREFIX:
-#     os.environ["TESSDATA_PREFIX"] = TESSDATA_PREFIX
-
-# # -------------------- Config --------------------
-# OCR_LANGS = "eng+kan+hin+tam+tel+mar+mal+guj+ben+pan"  # languages to support in OCR
-# EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-# EMBED_BATCH = 64
-# TOP_K = 5
-# SIMILARITY_THRESHOLD = 0.20   # tune if too strict / lenient
-# SUMMARY_CHUNK_CHARS = 3000    # characters per chunk for iterative summarization
-# MAX_CONTEXT_CHARS = 3500      # limit context sent in single LLM call to avoid TPM limits
-# SUMMARIES_TO_COMBINE = 6      # when doc large, combine N chunk summaries then summarize again
-
-# # -------------------- Clients / models --------------------
-# groq_client = Groq(api_key=GROQ_API_KEY)
-# embedder = SentenceTransformer(EMBED_MODEL)
-
-# # -------------------- Helpers: extraction --------------------
-# def extract_text_with_pymupdf_bytes(pdf_bytes):
-#     text = ""
-#     try:
-#         pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
-#         for pageno, page in enumerate(pdf, start=1):
-#             page_text = page.get_text("text")
-#             if page_text and page_text.strip():
-#                 text += f"\n\n[Page {pageno}]\n" + page_text
-#     except Exception:
-#         return ""
-#     return text.strip()
-
-# def extract_text_with_ocr_bytes(pdf_bytes):
-#     text = ""
-#     conv_kwargs = {}
-#     if POPPLER_PATH:
-#         conv_kwargs["poppler_path"] = POPPLER_PATH
-#     try:
-#         images = convert_from_bytes(pdf_bytes, **conv_kwargs)
-#     except Exception:
-#         return ""
-#     for i, img in enumerate(images, start=1):
-#         try:
-#             page_text = pytesseract.image_to_string(img, lang=OCR_LANGS)
-#             if page_text and page_text.strip():
-#                 text += f"\n\n[Page {i}]\n" + page_text
-#         except Exception:
-#             continue
-#     return text.strip()
-
-# def extract_text_from_pdf_file(file_obj):
-#     pdf_bytes = file_obj.read()
-#     text = extract_text_with_pymupdf_bytes(pdf_bytes)
-#     if len(text.strip()) < 50:
-#         ocr_text = extract_text_with_ocr_bytes(pdf_bytes)
-#         if len(ocr_text.strip()) > 20:
-#             text = ocr_text
-#     return text
-
-# def extract_text_from_image_file(image_file):
+# def extract_text_from_image_turbo(image_file) -> str:
+#     """Ultra-fast image OCR"""
 #     try:
 #         img = Image.open(image_file)
-#         text = pytesseract.image_to_string(img, lang=OCR_LANGS)
-#         return text.strip()
-#     except Exception:
+        
+#         # Smart resize for speed
+#         max_dim = 2000  # Reduced from 4000
+#         if max(img.size) > max_dim:
+#             ratio = max_dim / max(img.size)
+#             new_size = tuple(int(dim * ratio) for dim in img.size)
+#             img = img.resize(new_size, Image.Resampling.BILINEAR)  # Faster than LANCZOS
+        
+#         return turbo_ocr.fast_ocr(img)
+#     except Exception as e:
+#         logger.error(f"Image OCR error: {e}")
 #         return ""
 
-# # -------------------- Helpers: chunking --------------------
-# def chunk_text_keep_meta(text, source_name, chunk_chars=2000, overlap_chars=300):
-#     if not text:
+# # -------------------- FAST CHUNKING --------------------
+# @lru_cache(maxsize=256)
+# def chunk_text_fast(text: str, source_name: str) -> Tuple[List[str], List[Dict]]:
+#     """Fast chunking with minimal overhead"""
+#     if not text or len(text.strip()) < 30:
 #         return [], []
-#     text = text.strip()
-#     chunks = []
-#     meta = []
-#     start = 0
-#     L = len(text)
-#     while start < L:
-#         end = start + chunk_chars
-#         chunk = text[start:end].strip()
-#         if chunk:
-#             chunks.append(chunk)
-#             meta.append({"source": source_name})
-#         start += chunk_chars - overlap_chars
+    
+#     chunks, meta = [], []
+    
+#     # Fast page splitting
+#     pages = re.split(r'\[Page\s+(\d+)\]', text)
+    
+#     current_page = 1
+#     for i, segment in enumerate(pages):
+#         if not segment.strip():
+#             continue
+        
+#         if segment.strip().isdigit():
+#             current_page = int(segment)
+#             continue
+        
+#         page_text = segment.strip()
+        
+#         # Fast chunking - no complex sentence splitting
+#         if len(page_text) <= CHUNK_SIZE:
+#             chunks.append(page_text)
+#             meta.append({"source": source_name, "page": current_page})
+#         else:
+#             # Simple chunking by character count
+#             for start in range(0, len(page_text), CHUNK_SIZE - CHUNK_OVERLAP):
+#                 chunk = page_text[start:start + CHUNK_SIZE]
+#                 if chunk.strip():
+#                     chunks.append(chunk.strip())
+#                     meta.append({"source": source_name, "page": current_page})
+    
 #     return chunks, meta
 
-# # -------------------- Helpers: embeddings & faiss --------------------
-# def embed_texts_in_batches(texts):
-#     if not texts:
-#         return np.zeros((0, embedder.get_sentence_embedding_dimension()), dtype="float32")
-#     vectors = embedder.encode(texts, convert_to_numpy=True, show_progress_bar=False, batch_size=EMBED_BATCH)
-#     return np.asarray(vectors, dtype="float32")
+# # -------------------- FAST EMBEDDINGS --------------------
+# @st.cache_resource
+# def get_fast_vectorizer():
+#     """Optimized vectorizer for speed"""
+#     return TfidfVectorizer(
+#         max_features=2000,  # Reduced from 3000
+#         ngram_range=(1, 2),  # Reduced from (1,4)
+#         min_df=1,
+#         max_df=0.95,
+#         token_pattern=r'(?u)\b\w+\b'
+#     )
 
-# def build_faiss_index(emb_np):
+# def embed_texts_fast(texts: List[str], vectorizer=None) -> Tuple[np.ndarray, any]:
+#     """Fast embedding with caching"""
+    
+#     # Generate cache key
+#     texts_hash = hashlib.md5("".join(texts[:5]).encode()).hexdigest()
+#     cache_key = f"embed_{texts_hash}_{len(texts)}"
+    
+#     cached = embedding_cache.get(cache_key)
+#     if cached and vectorizer is not None:
+#         return cached
+    
+#     try:
+#         if vectorizer is None:
+#             vectorizer = get_fast_vectorizer()
+#             matrix = vectorizer.fit_transform(texts)
+#         else:
+#             matrix = vectorizer.transform(texts)
+        
+#         result = matrix.toarray().astype("float32"), vectorizer
+        
+#         if vectorizer is not None:
+#             embedding_cache.set(cache_key, result)
+        
+#         return result
+#     except Exception as e:
+#         logger.error(f"Embedding error: {e}")
+#         return np.zeros((len(texts), 100), dtype="float32"), None
+
+# def build_faiss_index_fast(emb_np: np.ndarray):
+#     """Fast FAISS index building"""
 #     if emb_np is None or emb_np.shape[0] == 0:
 #         raise ValueError("Empty embeddings")
-#     faiss.normalize_L2(emb_np)
+    
+#     # Simple normalization
+#     norms = np.linalg.norm(emb_np, axis=1, keepdims=True)
+#     norms[norms == 0] = 1
+#     emb_np = emb_np / norms
+    
 #     dim = emb_np.shape[1]
-#     idx = faiss.IndexFlatIP(dim)
-#     idx.add(emb_np.astype("float32"))
-#     return idx
-
-# # -------------------- Helpers: Groq LLM utilities --------------------
-# LANG_MAP = {
-#     "kn":"Kannada","hi":"Hindi","ta":"Tamil","te":"Telugu","mr":"Marathi",
-#     "ml":"Malayalam","gu":"Gujarati","bn":"Bengali","pa":"Punjabi","en":"English"
-# }
-
-# def ask_groq_with_context(context, question, lang_code="en", require_quotes=True, highlights=False):
-#     lang_name = LANG_MAP.get(lang_code, "the same language as the question")
-#     quote_instr = "When giving numeric/date/name facts, quote the exact excerpt from CONTEXT and include source." if require_quotes else ""
-#     highlight_instr = "Also provide key highlights and bullet-list important parts." if highlights else ""
-
-#     prompt = f"""
-# You are a careful PDF-QA assistant. Use ONLY the CONTEXT below to answer the QUESTION. Do NOT invent facts.
-# If the answer cannot be found in the CONTEXT, reply exactly: "This question is not related to the uploaded PDF."
-# Answer concisely in {lang_name}.
-
-# {quote_instr}
-# {highlight_instr}
-
-# --- CONTEXT START ---
-# {context}
-# --- CONTEXT END ---
-
-# QUESTION:
-# {question}
-
-# Answer:
-# """
-#     resp = groq_client.chat.completions.create(
-#         model="llama-3.1-8b-instant",
-#         messages=[{"role":"user","content": prompt}],
-#         temperature=0.0,
-#         max_tokens=700
-#     )
-#     try:
-#         return resp.choices[0].message.content.strip()
-#     except Exception:
-#         return "Sorry — LLM failed to return an answer."
-
-# # Iterative summarization to avoid payload errors (chunk -> summarize -> combine)
-# def summarize_large_text_iteratively(full_text, lang_code="en"):
-#     # first split into char chunks
-#     if not full_text or len(full_text.strip()) < 30:
-#         return "No extractable text to summarize."
-
-#     parts = []
-#     L = len(full_text)
-#     step = SUMMARY_CHUNK_CHARS
-#     overlap = 400
-#     i = 0
-#     while i < L:
-#         part = full_text[i:i+step]
-#         parts.append(part)
-#         i += step - overlap
-
-#     # Summarize each part
-#     part_summaries = []
-#     for p in parts:
-#         prompt = f"""
-# You are a helpful summarizer. Summarize the following passage in up to 200 words in {LANG_MAP.get(lang_code,'the same language')}.
-# Do NOT add any facts not present.
-# Passage:
-# {p}
-# Summary:
-# """
-#         resp = groq_client.chat.completions.create(
-#             model="llama-3.1-8b-instant",
-#             messages=[{"role":"user","content":prompt}],
-#             max_tokens=350,
-#             temperature=0.0
-#         )
-#         try:
-#             s = resp.choices[0].message.content.strip()
-#         except Exception:
-#             s = ""
-#         if s:
-#             part_summaries.append(s)
-
-#     # If many part_summaries, combine in groups to avoid token overload
-#     while len(part_summaries) > SUMMARIES_TO_COMBINE:
-#         new_summaries = []
-#         for j in range(0, len(part_summaries), SUMMARIES_TO_COMBINE):
-#             group = "\n\n".join(part_summaries[j:j+SUMMARIES_TO_COMBINE])
-#             prompt = f"Combine and condense these summaries into one concise summary (max 200 words):\n\n{group}\n\nCombined summary:"
-#             resp = groq_client.chat.completions.create(
-#                 model="llama-3.1-8b-instant",
-#                 messages=[{"role":"user","content":prompt}],
-#                 max_tokens=400,
-#                 temperature=0.0
-#             )
-#             try:
-#                 ns = resp.choices[0].message.content.strip()
-#             except Exception:
-#                 ns = ""
-#             if ns:
-#                 new_summaries.append(ns)
-#         part_summaries = new_summaries
-
-#     # Final combine
-#     final_text = "\n\n".join(part_summaries)
-#     prompt = f"Produce a final formal summary (3-6 short sentences) and then a simple brief summary for a general user. Text:\n\n{final_text}\n\nOutput:"
-#     resp = groq_client.chat.completions.create(
-#         model="llama-3.1-8b-instant",
-#         messages=[{"role":"user","content":prompt}],
-#         max_tokens=600,
-#         temperature=0.0
-#     )
-#     try:
-#         return resp.choices[0].message.content.strip()
-#     except Exception:
-#         return "Sorry — could not produce final summary."
-
-# # -------------------- Streamlit UI --------------------
-# st.set_page_config(page_title="Multilingual PDF Chatbot", layout="wide")
-# st.title("📄 Multilingual PDF Chatbot — OCR, Multilingual, Groq + FAISS")
-# st.markdown("**Hello!** I can read your uploaded PDFs or images (scanned or text), extract multilingual text, and answer or summarize based ONLY on the document. How can I help you today?")
-
-# # session-state defaults
-# if "chunks" not in st.session_state:
-#     st.session_state.chunks = []
-# if "meta" not in st.session_state:
-#     st.session_state.meta = []
-# if "embeddings" not in st.session_state:
-#     st.session_state.embeddings = None
-# if "faiss_index" not in st.session_state:
-#     st.session_state.faiss_index = None
-# if "full_text" not in st.session_state:
-#     st.session_state.full_text = ""
-# if "chat_history" not in st.session_state:
-#     st.session_state.chat_history = []
-
-# # Sidebar: upload PDFs & images
-# st.sidebar.header("Upload PDFs or images")
-# uploaded_pdfs = st.sidebar.file_uploader("Upload PDF files (one or more)", accept_multiple_files=True, type=["pdf"])
-# uploaded_images = st.sidebar.file_uploader("Upload scanned images (jpg/png) — optional", accept_multiple_files=True, type=["png","jpg","jpeg"])
-# process_btn = st.sidebar.button("Process uploads")
-
-# # PROCESS callback implemented inline when button pressed
-# if process_btn:
-#     # reset previous
-#     st.session_state.chunks = []
-#     st.session_state.meta = []
-#     st.session_state.embeddings = None
-#     st.session_state.faiss_index = None
-#     st.session_state.full_text = ""
-#     st.success("Started processing uploads — this may take a moment for OCR & embeddings.")
-
-#     # PDFs
-#     for pdf in uploaded_pdfs or []:
-#         st.sidebar.write(f"Extracting: {pdf.name} ...")
-#         text = extract_text_from_pdf_file(pdf)
-#         if not text or len(text.strip()) < 20:
-#             st.sidebar.write(f" → Very little text extracted from {pdf.name}.")
-#         st.session_state.full_text += f"\n\n[File: {pdf.name}]\n{(text or '')}"
-#         ch, md = chunk_text_keep_meta(text or "", pdf.name)
-#         for c,m in zip(ch, md):
-#             st.session_state.chunks.append(c)
-#             st.session_state.meta.append(m)
-
-#     # Images
-#     for imgf in uploaded_images or []:
-#         st.sidebar.write(f"OCR image: {imgf.name} ...")
-#         txt = extract_text_from_image_file(imgf)
-#         st.session_state.full_text += f"\n\n[Image: {imgf.name}]\n{txt}"
-#         ch, md = chunk_text_keep_meta(txt or "", imgf.name)
-#         for c,m in zip(ch, md):
-#             st.session_state.chunks.append(c)
-#             st.session_state.meta.append(m)
-
-#     # build embeddings & FAISS if we have chunks
-#     if st.session_state.chunks:
-#         st.sidebar.info("Computing embeddings...")
-#         emb_np = embed_texts_in_batches(st.session_state.chunks)
-#         if emb_np.shape[0] == 0:
-#             st.sidebar.error("Embeddings failed. No vectors created.")
-#         else:
-#             st.session_state.embeddings = emb_np
-#             st.session_state.faiss_index = build_faiss_index(emb_np.copy())
-#             st.sidebar.success(f"Created vector store ({emb_np.shape[0]} chunks).")
+    
+#     # Use FlatIP for small datasets (fastest)
+#     if emb_np.shape[0] < 5000:
+#         index = faiss.IndexFlatIP(dim)
+#         index.add(emb_np)
 #     else:
-#         st.sidebar.warning("No chunks extracted from uploads. Try increasing image quality / installing tessdata for languages.")
+#         # IVF for larger datasets
+#         nlist = min(100, emb_np.shape[0] // 50)
+#         quantizer = faiss.IndexFlatIP(dim)
+#         index = faiss.IndexIVFFlat(quantizer, dim, nlist)
+#         index.train(emb_np)
+#         index.add(emb_np)
+#         index.nprobe = 5  # Reduced for speed
+    
+#     return index
 
-# # Chat UI
-# st.markdown("---")
-# st.subheader("Chat — ask questions about the uploaded documents")
+# # -------------------- FAST RETRIEVAL --------------------
+# def retrieve_context_fast(query: str, chunks: List[str], metadata: List[Dict],
+#                          index, vectorizer, top_k: int = TOP_K) -> Tuple[str, List[Dict]]:
+#     """Lightning-fast retrieval"""
+#     if not chunks or index is None:
+#         return "", []
+    
+#     try:
+#         # Embed query
+#         q_vec = vectorizer.transform([query]).toarray().astype("float32")
+        
+#         # Normalize
+#         norm = np.linalg.norm(q_vec)
+#         if norm > 0:
+#             q_vec = q_vec / norm
+        
+#         # Fast search
+#         D, I = index.search(q_vec, min(top_k, len(chunks)))
+        
+#         # Quick filtering and context building
+#         context_parts = []
+#         selected_meta = []
+        
+#         for idx, score in zip(I[0], D[0]):
+#             if idx < len(chunks) and score >= SIMILARITY_THRESHOLD:
+#                 context_parts.append(chunks[idx])
+#                 selected_meta.append(metadata[idx])
+        
+#         # Fast join
+#         full_context = "\n\n".join(context_parts[:top_k])
+        
+#         # Fast truncation
+#         if len(full_context) > MAX_CONTEXT_CHARS:
+#             full_context = full_context[:MAX_CONTEXT_CHARS]
+        
+#         return full_context, selected_meta[:top_k]
+    
+#     except Exception as e:
+#         logger.error(f"Retrieval error: {e}")
+#         return "", []
 
-# if not st.session_state.faiss_index:
-#     st.info("Please upload & process PDFs or images from the sidebar to enable chat.")
-# else:
-#     # persistent text_input key is "question_input"
-#     if "question_input" not in st.session_state:
-#         st.session_state["question_input"] = ""
+# # -------------------- FAST LLM GENERATION --------------------
+# def generate_answer_fast(query: str, context: str) -> str:
+#     """Fast answer generation with minimal prompt"""
+    
+#     system_prompt = """You are IntelliDoc. Answer based ONLY on the provided context. Be concise and accurate. Cite page numbers."""
+    
+#     messages = [
+#         {"role": "system", "content": system_prompt},
+#         {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer:"}
+#     ]
+    
+#     try:
+#         response = groq_client.chat.completions.create(
+#             model=FAST_MODEL,
+#             messages=messages,
+#             temperature=0.1,
+#             max_tokens=MAX_OUTPUT_TOKENS,
+#             top_p=0.9,
+#             stream=False
+#         )
+#         return response.choices[0].message.content.strip()
+#     except Exception as e:
+#         logger.error(f"LLM error: {e}")
+#         return "Error generating response. Please try again."
 
-#     # We'll use on_click callback to process (so we can safely clear the widget)
-#     def on_ask():
-#         q = st.session_state.get("question_input", "").strip()
-#         if not q:
-#             return
-#         st.session_state.chat_history.append(("user", q))
-#         # detect language
-#         try:
-#             user_lang = detect(q)
-#         except Exception:
-#             user_lang = "en"
+# # -------------------- UTILITIES --------------------
+# @lru_cache(maxsize=128)
+# def detect_language_fast(text: str) -> str:
+#     """Fast language detection"""
+#     try:
+#         return detect(text[:200])
+#     except:
+#         return "en"
 
-#         # If user asks for broad explanation / summary, run iterative summarization over full_text
-#         q_lower = q.lower()
-#         summary_triggers = ["explain", "summary", "what is in", "what's in", "brief", "give an overview", "describe this document", "what does this pdf say", "explain this pdf", "tell me about this pdf"]
-#         is_summary = any(t in q_lower for t in summary_triggers)
+# def format_page_refs_fast(metadata: List[Dict]) -> str:
+#     """Fast page reference formatting"""
+#     if not metadata:
+#         return ""
+    
+#     sources = {}
+#     for m in metadata:
+#         src = m.get('source', 'Unknown')
+#         pg = m.get('page')
+#         if src not in sources:
+#             sources[src] = set()
+#         if pg:
+#             sources[src].add(pg)
+    
+#     refs = []
+#     for src, pages in sources.items():
+#         page_list = sorted(list(pages))[:5]  # Limit to 5 pages
+#         refs.append(f"📄 {src} (p.{','.join(map(str, page_list))})")
+    
+#     return " | ".join(refs)
 
-#         if is_summary:
-#             # use iterative summarization to avoid payload limits
-#             full_txt = st.session_state.full_text
-#             if not full_txt or len(full_txt.strip()) < 20:
-#                 bot_ans = "I couldn't find substantial text in the uploaded documents to summarize. Try re-uploading a clearer scan or ensure tessdata for the document language is installed."
+# # -------------------- STREAMLIT UI (SPEED OPTIMIZED) --------------------
+# def init_session_state():
+#     """Initialize session state"""
+#     defaults = {
+#         'doc_texts': {},
+#         'all_chunks': [],
+#         'all_metadata': [],
+#         'vectorizer': None,
+#         'faiss_index': None,
+#         'chat_history': [],
+#         'processing': False
+#     }
+    
+#     for key, value in defaults.items():
+#         if key not in st.session_state:
+#             st.session_state[key] = value
+
+# def main():
+#     st.set_page_config(
+#         page_title="IntelliDoc Turbo",
+#         page_icon="⚡",
+#         layout="wide"
+#     )
+    
+#     init_session_state()
+    
+#     # Minimal CSS
+#     st.markdown("""
+#     <style>
+#     .main-header {font-size: 2.5rem; font-weight: 700; color: #FF5722; text-align: center;}
+#     .speed-badge {background: #FF5722; color: white; padding: 5px 15px; border-radius: 20px; font-weight: bold;}
+#     </style>
+#     """, unsafe_allow_html=True)
+    
+#     # Header
+#     col1, col2, col3 = st.columns([1, 2, 1])
+#     with col2:
+#         st.markdown('<div class="main-header">⚡ IntelliDoc TURBO</div>', unsafe_allow_html=True)
+#         st.markdown('<center><span class="speed-badge">10X FASTER</span></center>', unsafe_allow_html=True)
+    
+#     # Sidebar
+#     with st.sidebar:
+#         st.header("📁 Upload")
+        
+#         uploaded_files = st.file_uploader(
+#             "Drop PDF/Images here",
+#             type=["pdf", "png", "jpg", "jpeg"],
+#             accept_multiple_files=True
+#         )
+        
+#         force_ocr = st.checkbox("Force OCR", value=False)
+        
+#         if st.button("⚡ PROCESS", type="primary", use_container_width=True):
+#             if uploaded_files:
+#                 process_documents_turbo(uploaded_files, force_ocr)
 #             else:
-#                 bot_ans = summarize_large_text_iteratively(full_txt, lang_code=user_lang)
+#                 st.warning("Upload files first!")
+        
+#         if st.session_state.all_chunks:
+#             st.divider()
+#             st.metric("📄 Documents", len(st.session_state.doc_texts))
+#             st.metric("📑 Chunks", len(st.session_state.all_chunks))
+            
+#             if st.button("🗑️ Clear All"):
+#                 for key in ['doc_texts', 'all_chunks', 'all_metadata', 'chat_history']:
+#                     st.session_state[key] = [] if 'history' in key or 'chunks' in key or 'metadata' in key else {}
+#                 st.session_state.faiss_index = None
+#                 ocr_cache.clear()
+#                 text_cache.clear()
+#                 embedding_cache.clear()
+#                 st.rerun()
+    
+#     # Main Chat Interface
+#     st.header("💬 Chat")
+    
+#     # Query Input
+#     query = st.text_area(
+#         "Ask your question:",
+#         height=100,
+#         placeholder="What is this document about?"
+#     )
+    
+#     col1, col2 = st.columns([3, 1])
+#     with col1:
+#         ask_button = st.button("🚀 Ask", type="primary", use_container_width=True)
+#     with col2:
+#         if st.button("Clear Chat", use_container_width=True):
+#             st.session_state.chat_history = []
+#             st.rerun()
+    
+#     # Process Query
+#     if ask_button and query:
+#         if not st.session_state.all_chunks:
+#             st.error("⚠️ Process documents first!")
 #         else:
-#             # QA path (retrieve top chunks)
-#             qvec = embedder.encode([q], convert_to_numpy=True).astype("float32")
-#             faiss.normalize_L2(qvec)
-#             D, I = st.session_state.faiss_index.search(qvec, TOP_K)
-#             top_scores = D[0]
-#             top_idx = I[0]
-#             if len(top_scores) == 0 or top_scores[0] < SIMILARITY_THRESHOLD:
-#                 bot_ans = "This question is not related to the uploaded PDF."
+#             start_time = time.time()
+            
+#             with st.spinner("⚡ Processing..."):
+#                 # Retrieve
+#                 context, meta = retrieve_context_fast(
+#                     query,
+#                     st.session_state.all_chunks,
+#                     st.session_state.all_metadata,
+#                     st.session_state.faiss_index,
+#                     st.session_state.vectorizer
+#                 )
+                
+#                 if context:
+#                     # Generate
+#                     answer = generate_answer_fast(query, context)
+                    
+#                     elapsed = time.time() - start_time
+                    
+#                     # Display
+#                     st.success(f"✅ Answered in {elapsed:.2f}s")
+#                     st.markdown("### 💡 Answer")
+#                     st.markdown(answer)
+                    
+#                     # Sources
+#                     if meta:
+#                         st.info(f"📚 {format_page_refs_fast(meta)}")
+                    
+#                     # Save history
+#                     st.session_state.chat_history.append({
+#                         'query': query,
+#                         'answer': answer,
+#                         'time': elapsed
+#                     })
+#                 else:
+#                     st.warning("No relevant content found.")
+    
+#     # Chat History
+#     if st.session_state.chat_history:
+#         st.divider()
+#         st.subheader("📜 History")
+        
+#         for i, chat in enumerate(reversed(st.session_state.chat_history[-5:])):
+#             with st.expander(f"Q: {chat['query'][:50]}... ({chat['time']:.1f}s)"):
+#                 st.markdown(f"**Q:** {chat['query']}")
+#                 st.markdown(f"**A:** {chat['answer']}")
+
+# def process_documents_turbo(uploaded_files, force_ocr: bool):
+#     """Ultra-fast document processing"""
+    
+#     if st.session_state.processing:
+#         return
+    
+#     st.session_state.processing = True
+    
+#     progress = st.progress(0)
+#     status = st.empty()
+    
+#     start_time = time.time()
+    
+#     try:
+#         # Clear previous
+#         st.session_state.doc_texts = {}
+#         st.session_state.all_chunks = []
+#         st.session_state.all_metadata = []
+        
+#         total = len(uploaded_files)
+        
+#         # Process all files in parallel
+#         def process_file(uploaded_file):
+#             file_bytes = uploaded_file.read()
+#             file_name = uploaded_file.name
+            
+#             if file_name.lower().endswith('.pdf'):
+#                 text, pages_ok, total_pages = extract_text_from_pdf_turbo(
+#                     file_bytes, file_name, force_ocr
+#                 )
 #             else:
-#                 # assemble limited context (respect MAX_CONTEXT_CHARS)
-#                 pieces = []
-#                 total_chars = 0
-#                 for idx in top_idx:
-#                     if idx >= len(st.session_state.chunks):
-#                         continue
-#                     md = st.session_state.meta[idx]
-#                     chunk = st.session_state.chunks[idx]
-#                     piece = f"[Source: {md.get('source','unknown')}]\n{chunk}"
-#                     if total_chars + len(piece) > MAX_CONTEXT_CHARS:
-#                         break
-#                     pieces.append(piece)
-#                     total_chars += len(piece)
-#                 context = "\n\n---\n\n".join(pieces)
-#                 bot_ans = ask_groq_with_context(context, q, lang_code=user_lang, require_quotes=True, highlights=False)
-
-#         # append
-#         st.session_state.chat_history.append(("bot", bot_ans))
-#         # clear input for next query
-#         st.session_state["question_input"] = ""
-
-#     # show input & ask button (on_click uses callback)
-#     st.text_input("Ask your question (any language):", key="question_input")
-#     st.button("Ask", on_click=on_ask)
-
-#     # Display chat history
-#     st.markdown("### Conversation")
-#     for role, text in st.session_state.chat_history:
-#         if role == "user":
-#             st.markdown(f"**You:** {text}")
+#                 text = extract_text_from_image_turbo(io.BytesIO(file_bytes))
+            
+#             return file_name, text
+        
+#         # Parallel file processing
+#         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+#             futures = [executor.submit(process_file, f) for f in uploaded_files]
+            
+#             for idx, future in enumerate(as_completed(futures)):
+#                 file_name, text = future.result()
+                
+#                 progress.progress((idx + 1) / total)
+#                 status.text(f"Processing {file_name}...")
+                
+#                 if text and len(text.strip()) > 30:
+#                     st.session_state.doc_texts[file_name] = text
+                    
+#                     # Chunk
+#                     chunks, meta = chunk_text_fast(text, file_name)
+#                     st.session_state.all_chunks.extend(chunks)
+#                     st.session_state.all_metadata.extend(meta)
+        
+#         # Build index
+#         if st.session_state.all_chunks:
+#             status.text("Building search index...")
+            
+#             embeddings, vectorizer = embed_texts_fast(st.session_state.all_chunks)
+#             st.session_state.vectorizer = vectorizer
+            
+#             index = build_faiss_index_fast(embeddings)
+#             st.session_state.faiss_index = index
+            
+#             elapsed = time.time() - start_time
+            
+#             progress.progress(1.0)
+            
+#             st.success(f"""
+#             ⚡ **COMPLETED in {elapsed:.1f}s**
+#             - Files: {len(st.session_state.doc_texts)}
+#             - Chunks: {len(st.session_state.all_chunks)}
+#             - Speed: {len(st.session_state.all_chunks)/elapsed:.1f} chunks/sec
+#             """)
 #         else:
-#             st.markdown(f"**Bot:** {text}")
-#         st.markdown("---")
+#             st.warning("No text extracted.")
+    
+#     except Exception as e:
+#         st.error(f"Error: {str(e)}")
+    
+#     finally:
+#         st.session_state.processing = False
+#         progress.empty()
+#         status.empty()
 
-# st.markdown(
-#     """
-# **Tips**
-# - For better OCR: upload high-resolution scans (300 DPI) and ensure the appropriate `*.traineddata` files exist in your Tesseract `tessdata` folder.
-# - If Groq complains about token limits for very large uploads, use the "Explain / Summary" feature which uses iterative summarization.
-# - Want the answer in English or another language? Ask: "Please answer in English" or "Translate the summary to English".
-# """
-# )
-
-
-
-
-
-
-
-#================================================================================================================================
+# if __name__ == "__main__":
+#     main()
 
 
 
@@ -859,28 +2502,30 @@
 
 
 
+#0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 
-
-
-
-
-
-
-
+# # app.py — IntelliDoc: AI-Powered Multilingual Document Analysis System
 # import os
-# import tempfile
 # import streamlit as st
 # from dotenv import load_dotenv
-# import fitz
-# from pdf2image import convert_from_bytes
+# import fitz  # PyMuPDF
+# from PIL import Image
 # import pytesseract
-
-# from sentence_transformers import SentenceTransformer
 # import numpy as np
 # import faiss
 # from groq import Groq
-
 # from langdetect import detect, DetectorFactory
+# from sklearn.feature_extraction.text import TfidfVectorizer
+# from concurrent.futures import ThreadPoolExecutor, as_completed
+# import time
+# import io
+# import json
+# from datetime import datetime
+# import pandas as pd
+# import cv2
+# import base64
+# import re
+
 # DetectorFactory.seed = 0
 
 # # -------------------- Load ENV --------------------
@@ -888,7 +2533,1698 @@
 # GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 # TESSERACT_CMD = os.getenv("TESSERACT_CMD", r"C:\Program Files\Tesseract-OCR\tesseract.exe")
 # TESSDATA_PREFIX = os.getenv("TESSDATA_PREFIX")
-# POPPLER_PATH = os.getenv("POPPLER_PATH")
+
+# pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+# if TESSDATA_PREFIX:
+#     os.environ["TESSDATA_PREFIX"] = TESSDATA_PREFIX
+
+#     # --- INSERT THIS CODE FOR DEBUGGING ---
+# print(f"DEBUG: TESSERACT_CMD resolved to: {pytesseract.pytesseract.tesseract_cmd}")
+# print(f"DEBUG: TESSDATA_PREFIX resolved to: {os.environ.get('TESSDATA_PREFIX')}")
+# # --- END DEBUGGING CODE ---
+
+# # -------------------- Config --------------------
+# OCR_LANGS = "eng+kan+hin+tam+tel+mar+mal+guj+ben+pan"
+# TOP_K = 8
+# SIMILARITY_THRESHOLD = 0.1
+# CHUNK_SIZE = 1500
+# CHUNK_OVERLAP = 300
+# MAX_CONTEXT_CHARS = 4500
+# MAX_WORKERS = 4
+
+# # -------------------- Clients --------------------
+# groq_client = Groq(api_key=GROQ_API_KEY)
+
+# @st.cache_resource
+# def get_tfidf_vectorizer():
+#     return TfidfVectorizer(
+#         max_features=1000,
+#         ngram_range=(1, 2),
+#         min_df=1,
+#         stop_words=None
+#     )
+
+# # -------------------- Table Extraction --------------------
+# def extract_tables_from_pdf(pdf_bytes, doc_name):
+#     """Extract tables from PDF"""
+#     tables = []
+#     try:
+#         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+#         for page_num, page in enumerate(doc, start=1):
+#             try:
+#                 # Extract tables using PyMuPDF
+#                 page_tables = page.find_tables()
+#                 if page_tables:
+#                     for table_idx, table in enumerate(page_tables.tables):
+#                         try:
+#                             table_data = table.extract()
+#                             if table_data:
+#                                 df = pd.DataFrame(table_data[1:], columns=table_data[0] if table_data else None)
+#                                 tables.append({
+#                                     'doc': doc_name,
+#                                     'page': page_num,
+#                                     'table_num': table_idx + 1,
+#                                     'data': df
+#                                 })
+#                         except:
+#                             continue
+#             except:
+#                 continue
+#         doc.close()
+#     except Exception as e:
+#         st.warning(f"Table extraction error: {e}")
+#     return tables
+
+# # -------------------- Chart/Diagram Detection --------------------
+# def detect_visual_elements(pdf_bytes, doc_name):
+#     """Detect charts, diagrams, flowcharts in PDF"""
+#     visuals = []
+#     try:
+#         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+#         for page_num, page in enumerate(doc, start=1):
+#             # Get images from page
+#             image_list = page.get_images()
+            
+#             if image_list:
+#                 for img_idx, img_info in enumerate(image_list):
+#                     try:
+#                         xref = img_info[0]
+#                         base_image = doc.extract_image(xref)
+#                         image_bytes = base_image["image"]
+                        
+#                         # Convert to PIL Image
+#                         img = Image.open(io.BytesIO(image_bytes))
+                        
+#                         # Analyze image to detect if it's a chart/diagram
+#                         img_array = np.array(img.convert('RGB'))
+                        
+#                         # Simple heuristics to detect charts/diagrams
+#                         # Check for lines, geometric shapes, etc.
+#                         gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+#                         edges = cv2.Canny(gray, 50, 150)
+                        
+#                         # Count edge pixels (charts have lots of edges)
+#                         edge_ratio = np.count_nonzero(edges) / edges.size
+                        
+#                         visual_type = "Unknown"
+#                         if edge_ratio > 0.05:
+#                             # Try to determine type
+#                             if edge_ratio > 0.15:
+#                                 visual_type = "Flowchart/Diagram"
+#                             elif edge_ratio > 0.08:
+#                                 visual_type = "Chart/Graph"
+#                             else:
+#                                 visual_type = "Image"
+                        
+#                         visuals.append({
+#                             'doc': doc_name,
+#                             'page': page_num,
+#                             'type': visual_type,
+#                             'image': img,
+#                             'size': img.size
+#                         })
+#                     except:
+#                         continue
+#         doc.close()
+#     except Exception as e:
+#         st.warning(f"Visual detection error: {e}")
+#     return visuals
+
+# # -------------------- Smart OCR Detection --------------------
+# def needs_ocr(page):
+#     """Quickly determine if a page needs OCR"""
+#     text = page.get_text("text")
+#     if len(text.strip()) > 50:
+#         return False
+#     image_list = page.get_images()
+#     if len(image_list) > 0:
+#         return True
+#     return True
+
+# def extract_text_from_page_fast(page, page_num, use_ocr=False):
+#     """Fast text extraction with page number tracking"""
+#     if not use_ocr:
+#         text = page.get_text("text")
+#         if len(text.strip()) > 50:
+#             return text.strip(), page_num
+    
+#     try:
+#         mat = fitz.Matrix(2.0, 2.0)
+#         pix = page.get_pixmap(matrix=mat, alpha=False)
+#         img_data = pix.tobytes("png")
+#         img = Image.open(io.BytesIO(img_data))
+        
+#         text = pytesseract.image_to_string(
+#             img, 
+#             lang=OCR_LANGS,
+#             config='--psm 6 --oem 3'
+#         )
+#         return text.strip(), page_num
+#     except Exception as e:
+#         return "", page_num
+
+# # -------------------- Parallel PDF Processing --------------------
+# def process_page(page_info):
+#     """Process a single page"""
+#     page_num, page, doc_name, force_ocr = page_info
+    
+#     try:
+#         use_ocr = force_ocr or needs_ocr(page)
+#         text, pg_num = extract_text_from_page_fast(page, page_num + 1, use_ocr=use_ocr)
+        
+#         if text:
+#             return {
+#                 'page_num': page_num,
+#                 'actual_page': page_num + 1,
+#                 'text': text,
+#                 'doc_name': doc_name,
+#                 'success': True
+#             }
+#         return {'success': False}
+#     except Exception as e:
+#         return {'success': False, 'error': str(e)}
+
+# def extract_text_from_pdf_parallel(pdf_bytes, doc_name, force_ocr=False):
+#     """Extract text from PDF using parallel processing"""
+#     try:
+#         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+#         total_pages = len(doc)
+        
+#         page_tasks = [
+#             (i, doc[i], doc_name, force_ocr) 
+#             for i in range(total_pages)
+#         ]
+        
+#         results = []
+#         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+#             future_to_page = {
+#                 executor.submit(process_page, task): task[0] 
+#                 for task in page_tasks
+#             }
+            
+#             for future in as_completed(future_to_page):
+#                 result = future.result()
+#                 if result.get('success'):
+#                     results.append(result)
+        
+#         doc.close()
+#         results.sort(key=lambda x: x['page_num'])
+        
+#         full_text = ""
+#         for r in results:
+#             page_num = r['actual_page']
+#             text = r['text']
+#             full_text += f"\n\n[Page {page_num}]\n{text}"
+        
+#         return full_text, len(results), total_pages
+        
+#     except Exception as e:
+#         st.error(f"PDF processing error: {e}")
+#         return "", 0, 0
+
+# def extract_text_from_image_fast(image_file):
+#     """Fast image OCR"""
+#     try:
+#         img = Image.open(image_file)
+#         max_size = 2000
+#         if max(img.size) > max_size:
+#             ratio = max_size / max(img.size)
+#             new_size = tuple(int(dim * ratio) for dim in img.size)
+#             img = img.resize(new_size, Image.Resampling.LANCZOS)
+        
+#         text = pytesseract.image_to_string(
+#             img,
+#             lang=OCR_LANGS,
+#             config='--psm 6 --oem 3'
+#         )
+#         return text.strip()
+#     except Exception as e:
+#         st.warning(f"Image OCR failed: {e}")
+#         return ""
+
+# # -------------------- Chunking --------------------
+# def chunk_text_smart(text, source_name, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+#     """Smart chunking with page tracking"""
+#     if not text or len(text.strip()) < 50:
+#         return [], []
+    
+#     chunks, meta = [], []
+#     pages = text.split('[Page ')
+    
+#     for page_section in pages:
+#         if not page_section.strip():
+#             continue
+        
+#         page_num = None
+#         if ']' in page_section:
+#             try:
+#                 page_num = int(page_section.split(']')[0])
+#                 page_text = page_section.split(']', 1)[1]
+#             except:
+#                 page_text = page_section
+#         else:
+#             page_text = page_section
+        
+#         start = 0
+#         chunk_id = 0
+        
+#         while start < len(page_text):
+#             end = start + chunk_size
+#             chunk = page_text[start:end].strip()
+            
+#             if chunk:
+#                 chunks.append(chunk)
+#                 meta.append({
+#                     "source": source_name,
+#                     "page": page_num,
+#                     "chunk_id": chunk_id
+#                 })
+#                 chunk_id += 1
+            
+#             start += chunk_size - overlap
+    
+#     return chunks, meta
+
+# # -------------------- TF-IDF Embeddings --------------------
+# def embed_texts_tfidf(texts, vectorizer=None):
+#     """Fast TF-IDF embeddings"""
+#     try:
+#         if vectorizer is None:
+#             vectorizer = get_tfidf_vectorizer()
+#             matrix = vectorizer.fit_transform(texts)
+#         else:
+#             matrix = vectorizer.transform(texts)
+        
+#         return matrix.toarray().astype("float32"), vectorizer
+#     except Exception as e:
+#         st.error(f"Embedding error: {e}")
+#         return np.zeros((len(texts), 100), dtype="float32"), None
+
+# def build_faiss_index(emb_np):
+#     """Build FAISS index"""
+#     if emb_np is None or emb_np.shape[0] == 0:
+#         raise ValueError("Empty embeddings")
+    
+#     norms = np.linalg.norm(emb_np, axis=1, keepdims=True)
+#     norms[norms == 0] = 1
+#     emb_np = emb_np / norms
+    
+#     dim = emb_np.shape[1]
+#     idx = faiss.IndexFlatIP(dim)
+#     idx.add(emb_np)
+#     return idx
+
+# # -------------------- Language Utilities --------------------
+# LANG_MAP = {
+#     "kn": "Kannada", "hi": "Hindi", "ta": "Tamil", "te": "Telugu",
+#     "mr": "Marathi", "ml": "Malayalam", "gu": "Gujarati",
+#     "bn": "Bengali", "pa": "Punjabi", "en": "English"
+# }
+
+# LANG_CODES = {
+#     "english": "en", "kannada": "kn", "hindi": "hi", "tamil": "ta",
+#     "telugu": "te", "marathi": "mr", "malayalam": "ml", "gujarati": "gu",
+#     "bengali": "bn", "punjabi": "pa"
+# }
+
+# #...................................................................................
+
+# def detect_language_robust(text: str) -> str:
+#     """Robust language detection with fallback"""
+#     try:
+#         return detect(text)
+#     except LangDetectException:
+#         # Fallback: check for script-specific characters
+#         if re.search(r'[\u0C80-\u0CFF]', text):  # Kannada
+#             return "kn"
+#         elif re.search(r'[\u0900-\u097F]', text):  # Hindi
+#             return "hi"
+#         elif re.search(r'[\u0C00-\u0C7F]', text):  # Telugu
+#             return "te"
+#         elif re.search(r'[\u0B80-\u0BFF]', text):  # Tamil
+#             return "ta"
+#         return "en"
+
+# def extract_target_language(question: str) -> Optional[str]:
+#     """Extract target language from query"""
+#     q_lower = question.lower()
+#     for lang_name, code in LANG_CODES.items():
+#         if f"in {lang_name}" in q_lower or f"to {lang_name}" in q_lower:
+#             return code
+#     return None
+
+# # -------------------- Hallucination Reduction & Fact-Checking --------------------
+# class FactualityEnhancer:
+#     """Reduce hallucinations and improve factuality"""
+
+#     @staticmethod
+#     def verify_response(response: str, context: str) -> Tuple[str, float]:
+#         """
+#         Verify response against context
+#         Returns: (verified_response, confidence_score)
+#         """
+#         # Check if response contains information not in context
+#         response_words = set(re.findall(r'\w+', response.lower()))
+#         context_words = set(re.findall(r'\w+', context.lower()))
+
+#         # Calculate overlap
+#         overlap = len(response_words.intersection(context_words))
+#         total = len(response_words)
+
+#         confidence = overlap / total if total > 0 else 0.0
+
+#         # Flag suspicious content
+#         suspicious_phrases = [
+#             "i think", "probably", "might be", "could be",
+#             "it seems", "appears to be", "likely"
+#         ]
+
+#         contains_speculation = any(phrase in response.lower() for phrase in suspicious_phrases)
+
+#         if contains_speculation and confidence < 0.5:
+#             verified = "Based on the available context, I cannot provide a definitive answer to this question. The information may not be present in the uploaded documents."
+#             return verified, 0.3
+
+#         return response, confidence
+
+#     @staticmethod
+#     def add_citations(response: str, metadata: List[Dict]) -> str:
+#         """Add source citations to response"""
+#         if not metadata:
+#             return response
+
+#         pages = set(m.get('page') for m in metadata if m.get('page'))
+#         if pages:
+#             citation = f"\n\n[Sources: Pages {', '.join(map(str, sorted(pages)))}]"
+#             return response + citation
+
+#         return response
+
+# fact_checker = FactualityEnhancer()
+
+# # -------------------- Advanced LLM Interaction with Anti-Hallucination --------------------
+# def call_llm_with_retry(prompt: str, max_retries: int = 3) -> str:
+#     """Call LLM with retry logic"""
+#     for attempt in range(max_retries):
+#         try:
+#             resp = groq_client.chat.completions.create(
+#                 model="llama-3.3-70b-versatile",
+#                 messages=[{"role": "user", "content": prompt}],
+#                 temperature=0.05,  # Very low for factuality
+#                 max_tokens=MAX_OUTPUT_TOKENS,
+#                 top_p=0.9
+#             )
+#             return resp.choices[0].message.content.strip()
+#         except Exception as e:
+#             # logger.warning(f"LLM attempt {attempt + 1} failed: {e}") # Use logger if available
+#             print(f"LLM attempt {attempt + 1} failed: {e}")
+#             if attempt < max_retries - 1:
+#                 time.sleep(2 ** attempt)  # Exponential backoff
+#             else:
+#                 raise
+#     return "Error: Unable to generate response after multiple attempts."
+
+# def ask_groq_production(context: str, question: str, target_lang: Optional[str] = None,
+#                         metadata: List[Dict] = None) -> str:
+#     """Production-grade QA with anti-hallucination measures"""
+
+#     if target_lang:
+#         response_lang = LANG_MAP.get(target_lang, "the requested language")
+#     else:
+#         question_lang = detect_language_robust(question)
+#         response_lang = LANG_MAP.get(question_lang, "English")
+
+#     is_translation = any(kw in question.lower() for kw in
+#                          ["translate", "convert", "change to"])
+
+#     if is_translation:
+#         prompt = f"""You are a professional translator. Translate the following content to {response_lang}.
+# IMPORTANT INSTRUCTIONS:
+
+# Translate ONLY the information present in the CONTEXT
+# Preserve ALL details: numbers, names, dates, measurements
+# Maintain formatting and structure
+# Do NOT add any information not in the context
+# If context is insufficient, clearly state what's missing
+# CONTEXT:
+# {context}
+# USER REQUEST: {question}
+# Translation in {response_lang}:"""
+#     else:
+#         prompt = f"""You are a factual document analyst. Answer based ONLY on the provided CONTEXT.
+# CRITICAL ANTI-HALLUCINATION RULES:
+
+# Answer using ONLY information explicitly stated in the CONTEXT
+# If information is NOT in the context, respond: "This information is not found in the provided documents."
+# Do NOT infer, guess, or add information beyond what's explicitly stated
+# Quote specific details from context when possible
+# If partially available, state exactly what IS found and what ISN'T
+# Never use phrases like "probably", "might be", "I think" - only state facts from context
+# Cite page numbers when available
+# CONTEXT:
+# {context}
+# QUESTION: {question}
+# INSTRUCTIONS FOR RESPONSE:
+
+# Answer in {response_lang}
+# Be comprehensive but ONLY use information from context
+# Include ALL relevant details (numbers, names, dates, etc.)
+# Structure answer clearly
+# If answer requires information not in context, explicitly state what's missing
+# Factual answer in {response_lang}:"""
+
+#     try:
+#         response = call_llm_with_retry(prompt)
+
+#         # Verify factuality
+#         verified_response, confidence = fact_checker.verify_response(response, context)
+
+#         # Add citations if confidence is good
+#         if confidence > 0.6 and metadata:
+#             verified_response = fact_checker.add_citations(verified_response, metadata)
+#             return verified_response
+#     except Exception as e:
+#         # logger.error(f"LLM error: {e}") # Use logger if available
+#         print(f"LLM error: {e}")
+#         return f"Error generating response: {str(e)}"
+
+# def summarize_complete_production(text: str, target_lang: str = "en") -> str:
+#     """Production-grade complete summarization"""
+#     if not text or len(text.strip()) < 50:
+#         return "Insufficient text to summarize."
+
+#     lang_name = LANG_MAP.get(target_lang, "English")
+
+#     # Process in chunks if needed
+#     if len(text) <= MAX_SUMMARY_CHARS:
+#         prompt = f"""Provide a COMPREHENSIVE summary of this document in {lang_name}.
+# MANDATORY REQUIREMENTS:
+
+# Include ALL names, IDs, reference numbers
+# Include ALL dates, times, and time periods
+# Include ALL numerical data (scores, amounts, grades, measurements)
+# Include ALL categories, subjects, sections with their details
+# Include ALL results, outcomes, conclusions, status
+# Include organizational/institutional information
+# Main topics and key points
+# Do NOT omit ANY information
+# Document:
+# {text}
+# Complete detailed summary in {lang_name}:"""
+#         return call_llm_with_retry(prompt)
+
+#     # Multi-pass for large documents
+#     chunks = [text[i:i+MAX_SUMMARY_CHARS] for i in range(0, len(text), MAX_SUMMARY_CHARS)]
+#     chunk_summaries = []
+#     for idx, chunk in enumerate(chunks):
+#         prompt = f"""Summarize Part {idx+1} of {len(chunks)} in {lang_name}.
+# CRITICAL: Preserve ALL specific details including names, IDs, numbers, dates, scores, grades.
+# Text:
+# {chunk}
+# Detailed summary:"""
+
+#         try:
+#             summary = call_llm_with_retry(prompt)
+#             chunk_summaries.append(summary)
+#         except:
+#             continue
+
+#     # Combine
+#     combined = "\n\n".join(chunk_summaries)
+#     final_prompt = f"""Combine these section summaries into ONE COMPLETE summary in {lang_name}.
+# CRITICAL: Include ALL information without omitting any details.
+# Summaries:
+# {combined}
+# Final comprehensive summary:"""
+
+#     return call_llm_with_retry(final_prompt)
+
+# def extract_all_information(text: str, target_lang: str = "en") -> str:
+#     """Extract every piece of information"""
+#     lang_name = LANG_MAP.get(target_lang, "English")
+
+#     sections = [text[i:i+20000] for i in range(0, len(text), 20000)]
+#     all_info = []
+#     for section in sections:
+#         prompt = f"""Extract and list EVERY piece of information from this section in {lang_name}.
+# Create a comprehensive structured list:
+# 📋 ALL names (people, places, organizations)
+# 📅 ALL dates, times, periods
+# 🔢 ALL numbers, scores, amounts, measurements
+# 📊 ALL categories, subjects with values
+# ✅ ALL results, grades, outcomes
+# 🎯 ALL purposes, goals, objectives
+# 📍 ALL locations, addresses, contacts
+# 🆔 ALL IDs, codes, reference numbers
+# 📝 ALL additional details
+# Section:
+# {section}
+# Complete extraction:"""
+
+#         try:
+#             info = call_llm_with_retry(prompt)
+#             all_info.append(info)
+#         except:
+#             continue
+
+#     combined = "\n\n".join(all_info)
+#     if len(sections) > 1:
+#         final_prompt = f"""Organize all extracted information in {lang_name}.
+# Remove duplicates. Present clearly. Do NOT omit information.
+# Data:
+# {combined}
+# Organized complete information:"""
+
+#         return call_llm_with_retry(final_prompt)
+#     return combined
+
+# # -------------------- Audio Output --------------------
+# def text_to_speech_enhanced(text: str, lang: str = 'en') -> Optional[io.BytesIO]:
+#     """Enhanced TTS with language support"""
+#     try:
+#         from gtts import gTTS
+
+#         # Map language codes
+#         tts_lang = lang if lang in ['en', 'hi', 'kn', 'ta', 'te', 'ml', 'mr', 'gu', 'bn', 'pa'] else 'en'
+
+#         tts = gTTS(text=text[:500], lang=tts_lang, slow=False)  # Limit to 500 chars for speed
+#         fp = io.BytesIO()
+#         tts.write_to_fp(fp)
+#         fp.seek(0)
+#         return fp
+#     except ImportError:
+#         # logger.warning("gtts not installed") # Use logger if available
+#         print("WARNING: gtts not installed")
+#         return None
+#     except Exception as e:
+#         # logger.error(f"TTS error: {e}") # Use logger if available
+#         print(f"TTS error: {e}")
+#         return None
+
+# def create_audio_player(audio_fp: io.BytesIO) -> str:
+#     """Create HTML audio player"""
+#     audio_bytes = audio_fp.read()
+#     b64 = base64.b64encode(audio_bytes).decode()
+#     return f'<audio controls autoplay style="width: 100%;"><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>'
+
+# # -------------------- Download Functions --------------------
+# def create_chat_download(chat_history: List) -> str:
+#     """Create downloadable chat history"""
+#     chat_text = f"IntelliDoc Chat History - Enhanced Version\n"
+#     chat_text += f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+#     chat_text += "="*80 + "\n\n"
+
+#     for item in chat_history:
+#         if len(item) == 2:
+#             role, message = item
+#             source_pages = None
+#         else:
+#             role, message, source_pages = item
+
+#         if role == "user":
+#             chat_text += f"USER:\n{message}\n\n"
+#         else:
+#             chat_text += f"INTELLIDOC:\n{message}\n"
+#             if source_pages:
+#                 chat_text += f"Sources: {source_pages}\n"
+#             chat_text += "\n"
+#         chat_text += "-"*80 + "\n\n"
+#     return chat_text
+
+# def create_json_download(chat_history: List) -> str:
+#     """Create JSON format chat history"""
+#     conversations = []
+#     for item in chat_history:
+#         if len(item) == 2:
+#             role, message = item
+#             source_pages = None
+#         else:
+#             role, message, source_pages = item
+
+#         conversations.append({
+#             "role": role,
+#             "message": message,
+#             "sources": source_pages if role == "assistant" else None,
+#             "timestamp": datetime.now().isoformat()
+#         })
+#     chat_data = {
+#         "version": "IntelliDoc Enhanced v2.0",
+#         "timestamp": datetime.now().isoformat(),
+#         "conversation": conversations
+#     }
+#     return json.dumps(chat_data, indent=2, ensure_ascii=False)
+
+# #.....................................................................................
+
+# def detect_question_language(question):
+#     try:
+#         return detect(question)
+#     except:
+#         return "en"
+
+# def extract_target_language(question):
+#     q_lower = question.lower()
+#     for lang_name, code in LANG_CODES.items():
+#         if f"in {lang_name}" in q_lower or f"to {lang_name}" in q_lower:
+#             return code
+#     return None
+
+# # -------------------- Audio Functions --------------------
+# def get_audio_input():
+#     """Get audio input using HTML5 audio recorder"""
+#     audio_html = """
+#     <div style="text-align: center; padding: 20px;">
+#         <p style="color: #E0E0E0;">🎤 <strong>Voice Input Feature</strong></p>
+#         <p style="color: #888; font-size: 0.9em;">Note: Audio input requires microphone permissions.<br>
+#         Install speech_recognition and pyaudio packages for full functionality:<br>
+#         <code>pip install SpeechRecognition pyaudio</code></p>
+#     </div>
+#     """
+#     st.markdown(audio_html, unsafe_allow_html=True)
+
+# def text_to_speech_button(text, lang='en'):
+#     """Create audio download button"""
+#     try:
+#         # Note: Install gtts package: pip install gtts
+#         from gtts import gTTS
+        
+#         tts = gTTS(text=text, lang=lang, slow=False)
+#         fp = io.BytesIO()
+#         tts.write_to_fp(fp)
+#         fp.seek(0)
+        
+#         audio_base64 = base64.b64encode(fp.read()).decode()
+#         audio_html = f"""
+#         <audio controls autoplay style="width: 100%;">
+#             <source src="data:audio/mp3;base64,{audio_base64}" type="audio/mp3">
+#         </audio>
+#         """
+#         st.markdown(audio_html, unsafe_allow_html=True)
+#         return True
+#     except ImportError:
+#         st.info("💡 Install gtts for audio output: `pip install gtts`")
+#         return False
+#     except Exception as e:
+#         st.warning(f"Audio generation error: {e}")
+#         return False
+
+# # -------------------- QA & Summarization --------------------
+# def ask_groq_with_context(context, question, target_lang=None):
+#     """Answer questions using context"""
+#     if target_lang:
+#         response_lang = LANG_MAP.get(target_lang, "the requested language")
+#     else:
+#         question_lang = detect_question_language(question)
+#         response_lang = LANG_MAP.get(question_lang, "English")
+    
+#     is_translation = any(kw in question.lower() for kw in 
+#                          ["translate", "convert", "change to", "in kannada", "in hindi", 
+#                           "in telugu", "in marathi", "in tamil", "in english"])
+    
+#     if is_translation:
+#         prompt = f"""You are a multilingual translator.
+
+# CONTEXT from documents:
+# {context}
+
+# USER REQUEST: {question}
+
+# Translate the relevant information to {response_lang}. Be accurate and preserve details.
+
+# Response in {response_lang}:"""
+#     else:
+#         prompt = f"""Answer this question using ONLY the CONTEXT provided.
+
+# CONTEXT:
+# {context}
+
+# QUESTION: {question}
+
+# Answer in {response_lang}. If not in context, say "I cannot find this in the documents."
+
+# Answer:"""
+    
+#     try:
+#         resp = groq_client.chat.completions.create(
+#             model="llama-3.3-70b-versatile",
+#             messages=[{"role": "user", "content": prompt}],
+#             temperature=0.1,
+#             max_tokens=1000
+#         )
+#         return resp.choices[0].message.content.strip()
+#     except Exception as e:
+#         return f"Error: {e}"
+
+# def summarize_document(text, target_lang="en"):
+#     """Generate summary"""
+#     if not text or len(text.strip()) < 50:
+#         return "Insufficient text to summarize."
+    
+#     text_snippet = text[:8000]
+#     lang_name = LANG_MAP.get(target_lang, "English")
+    
+#     prompt = f"""Summarize this document in {lang_name}. Include main topic, key points, and important details.
+
+# {text_snippet}
+
+# Summary:"""
+    
+#     try:
+#         resp = groq_client.chat.completions.create(
+#             model="llama-3.3-70b-versatile",
+#             messages=[{"role": "user", "content": prompt}],
+#             temperature=0.2,
+#             max_tokens=800
+#         )
+#         return resp.choices[0].message.content.strip()
+#     except Exception as e:
+#         return f"Summarization failed: {e}"
+
+# # -------------------- Download Functions --------------------
+# def create_chat_download(chat_history):
+#     """Create downloadable chat history"""
+#     chat_text = f"IntelliDoc Chat History\n"
+#     chat_text += f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+#     chat_text += "="*80 + "\n\n"
+    
+#     for item in chat_history:
+#         if len(item) == 2:
+#             role, message = item
+#             source_pages = None
+#         else:
+#             role, message, source_pages = item
+        
+#         if role == "user":
+#             chat_text += f"USER:\n{message}\n\n"
+#         else:
+#             chat_text += f"INTELLIDOC:\n{message}\n"
+#             if source_pages:
+#                 chat_text += f"Sources: {source_pages}\n"
+#             chat_text += "\n"
+#         chat_text += "-"*80 + "\n\n"
+    
+#     return chat_text
+
+# def create_json_download(chat_history):
+#     """Create JSON format chat history"""
+#     conversations = []
+#     for item in chat_history:
+#         if len(item) == 2:
+#             role, message = item
+#             source_pages = None
+#         else:
+#             role, message, source_pages = item
+        
+#         conversations.append({
+#             "role": role,
+#             "message": message,
+#             "sources": source_pages if role == "assistant" else None
+#         })
+    
+#     chat_data = {
+#         "timestamp": datetime.now().isoformat(),
+#         "conversation": conversations
+#     }
+#     return json.dumps(chat_data, indent=2, ensure_ascii=False)
+
+# # -------------------- Custom CSS (Dark Theme) --------------------
+# # -------------------- Custom CSS (Professional Subtle Dark Theme) --------------------
+# def load_custom_css():
+#     st.markdown("""
+#     <style>
+#     /* Professional Dark theme */
+#     .stApp {
+#         background: #1e1e1e;
+#     }
+    
+#     /* Header */
+#     .main-header {
+#         background: #ffffff;
+#         padding: 35px;
+#         border-radius: 12px;
+#         text-align: center;
+#         margin-bottom: 25px;
+#         box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+#         border-bottom: 2px solid #4a9eff;
+#     }
+    
+#     .main-header h1 {
+#         color: #000000;
+#         font-size: 2.5em;
+#         font-weight: 700;
+#         margin: 0;
+#         letter-spacing: 1px;
+#     }
+    
+#     .main-header p {
+#         color: #000000;
+#         font-size: 1.1em;
+#         margin: 10px 0 0 0;
+#         font-weight: 400;
+#     }
+    
+#     /* Feature banner */
+#     .feature-banner {
+#         text-align: center;
+#         padding: 12px;
+#         background: #2d2d2d;
+#         border-radius: 8px;
+#         margin-bottom: 20px;
+#         border: 1px solid #3a3a3a;
+#     }
+    
+#     .feature-banner p {
+#         color: #b0b0b0;
+#         font-size: 0.95em;
+#         margin: 0;
+#     }
+    
+#     /* Chat messages */
+#     .user-message {
+#         background: #2d2d2d;
+#         color: #e0e0e0;
+#         padding: 18px;
+#         border-radius: 12px 12px 4px 12px;
+#         margin: 12px 0;
+#         border-left: 3px solid #4a9eff;
+#         box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+#     }
+    
+#     .bot-message {
+#         background: #252525;
+#         color: #d0d0d0;
+#         padding: 18px;
+#         border-radius: 12px 12px 12px 4px;
+#         margin: 12px 0;
+#         border-left: 3px solid #6c63ff;
+#         box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+#     }
+    
+#     .page-reference {
+#         display: inline-block;
+#         background: #4a9eff;
+#         color: white;
+#         padding: 4px 12px;
+#         border-radius: 12px;
+#         font-size: 0.8em;
+#         font-weight: 600;
+#         margin: 8px 4px 0 0;
+#         box-shadow: 0 2px 6px rgba(74,158,255,0.3);
+#     }
+    
+#     /* Buttons */
+#     .stButton>button {
+#         background: linear-gradient(135deg, #4a9eff 0%, #6c63ff 100%);
+#         color: white;
+#         border: none;
+#         border-radius: 8px;
+#         padding: 10px 24px;
+#         font-weight: 600;
+#         transition: all 0.3s;
+#         box-shadow: 0 3px 10px rgba(74,158,255,0.3);
+#     }
+    
+#     .stButton>button:hover {
+#         transform: translateY(-2px);
+#         box-shadow: 0 5px 15px rgba(74,158,255,0.4);
+#         background: linear-gradient(135deg, #5aa3ff 0%, #7d73ff 100%);
+#     }
+    
+#     /* Sidebar */
+#     [data-testid="stSidebar"] {
+#         background: #252525;
+#         border-right: 1px solid #3a3a3a;
+#     }
+    
+#     [data-testid="stSidebar"] h3 {
+#         color: #e0e0e0;
+#     }
+    
+#     [data-testid="stSidebar"] p, [data-testid="stSidebar"] label {
+#         color: #b0b0b0;
+#     }
+    
+#     /* Success/Info boxes */
+#     .stSuccess {
+#         background-color: rgba(74,158,255,0.1);
+#         border-left: 4px solid #4a9eff;
+#         color: #4a9eff;
+#         border-radius: 4px;
+#     }
+    
+#     .stInfo {
+#         background-color: rgba(108,99,255,0.1);
+#         border-left: 4px solid #6c63ff;
+#         color: #6c63ff;
+#         border-radius: 4px;
+#     }
+    
+#     .stWarning {
+#         background-color: rgba(255,179,0,0.1);
+#         border-left: 4px solid #ffb300;
+#         color: #ffb300;
+#         border-radius: 4px;
+#     }
+    
+#     .stError {
+#         background-color: rgba(255,82,82,0.1);
+#         border-left: 4px solid #ff5252;
+#         color: #ff5252;
+#         border-radius: 4px;
+#     }
+    
+#     /* File uploader */
+#     [data-testid="stFileUploader"] {
+#         background: #2d2d2d;
+#         border: 2px dashed #4a9eff;
+#         border-radius: 10px;
+#         padding: 20px;
+#     }
+    
+#     [data-testid="stFileUploader"] label {
+#         color: #b0b0b0;
+#     }
+    
+#     /* Input boxes */
+#     .stTextInput>div>div>input {
+#         background: #2d2d2d;
+#         color: #e0e0e0;
+#         border: 1px solid #4a4a4a;
+#         border-radius: 8px;
+#         padding: 10px;
+#     }
+    
+#     .stTextInput>div>div>input:focus {
+#         border-color: #4a9eff;
+#         box-shadow: 0 0 0 1px #4a9eff;
+#     }
+    
+#     /* Expander */
+#     .streamlit-expanderHeader {
+#         background: #2d2d2d;
+#         border-radius: 8px;
+#         color: #e0e0e0;
+#         font-weight: 600;
+#         border: 1px solid #3a3a3a;
+#     }
+    
+#     .streamlit-expanderHeader:hover {
+#         background: #353535;
+#         border-color: #4a9eff;
+#     }
+    
+#     /* Dataframe */
+#     .stDataFrame {
+#         background: #2d2d2d;
+#         border-radius: 8px;
+#     }
+    
+#     /* Markdown text */
+#     .stMarkdown {
+#         color: #d0d0d0;
+#     }
+    
+#     /* Checkbox */
+#     .stCheckbox {
+#         color: #b0b0b0;
+#     }
+    
+#     /* Radio buttons */
+#     .stRadio > label {
+#         color: #e0e0e0;
+#     }
+    
+#     .stRadio > div {
+#         color: #b0b0b0;
+#     }
+    
+#     /* Footer */
+#     .footer {
+#         text-align: center;
+#         color: #808080;
+#         padding: 25px;
+#         margin-top: 40px;
+#         border-top: 1px solid #3a3a3a;
+#     }
+    
+#     .footer h3 {
+#         color: #e0e0e0;
+#         margin-bottom: 15px;
+#         font-size: 1.3em;
+#     }
+    
+#     .footer a {
+#         color: #4a9eff;
+#         text-decoration: none;
+#         transition: color 0.3s;
+#     }
+    
+#     .footer a:hover {
+#         color: #6c63ff;
+#     }
+    
+#     /* Scrollbar */
+#     ::-webkit-scrollbar {
+#         width: 10px;
+#         height: 10px;
+#     }
+    
+#     ::-webkit-scrollbar-track {
+#         background: #1e1e1e;
+#     }
+    
+#     ::-webkit-scrollbar-thumb {
+#         background: #4a4a4a;
+#         border-radius: 5px;
+#     }
+    
+#     ::-webkit-scrollbar-thumb:hover {
+#         background: #5a5a5a;
+#     }
+    
+#     /* Divider */
+#     hr {
+#         border-color: #3a3a3a;
+#     }
+    
+#     /* Download buttons */
+#     .stDownloadButton>button {
+#         background: #2d2d2d;
+#         color: #4a9eff;
+#         border: 1px solid #4a9eff;
+#         border-radius: 8px;
+#         padding: 10px 20px;
+#         font-weight: 600;
+#         transition: all 0.3s;
+#     }
+    
+#     .stDownloadButton>button:hover {
+#         background: #4a9eff;
+#         color: white;
+#         transform: translateY(-2px);
+#     }
+    
+#     /* Feature grid */
+#     .feature-grid {
+#         display: grid;
+#         grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+#         gap: 15px;
+#         margin: 20px 0;
+#     }
+    
+#     .feature-card {
+#         background: #2d2d2d;
+#         padding: 15px;
+#         border-radius: 8px;
+#         border: 1px solid #3a3a3a;
+#         transition: all 0.3s;
+#     }
+    
+#     .feature-card:hover {
+#         border-color: #4a9eff;
+#         transform: translateY(-2px);
+#         box-shadow: 0 4px 12px rgba(74,158,255,0.2);
+#     }
+    
+#     .feature-card strong {
+#         color: #4a9eff;
+#         display: block;
+#         margin-bottom: 5px;
+#     }
+    
+#     .feature-card span {
+#         color: #909090;
+#         font-size: 0.9em;
+#     }
+#     </style>
+#     """, unsafe_allow_html=True)
+
+# # -------------------- Streamlit UI --------------------
+# st.set_page_config(
+#     page_title="IntelliDoc - AI Document Analysis",
+#     page_icon="📄",
+#     layout="wide",
+#     initial_sidebar_state="expanded"
+# )
+
+# # Load custom CSS
+# load_custom_css()
+
+# # Custom Header
+# # Custom Header
+# st.markdown("""
+# <div class="main-header">
+#     <h1>📄 IntelliDoc</h1>
+#     <p>AI-Powered Multilingual Document Analysis System</p>
+# </div>
+# """, unsafe_allow_html=True)
+
+# st.markdown("""
+# <div class="feature-banner">
+#     <p>
+#         ⚡ <strong>Features:</strong> Printed & Handwritten OCR | 10+ Languages | Real-Time Translation | 
+#         Table Extraction | Chart Detection | Audio I/O | 3x Faster Processing
+#     </p>
+# </div>
+# """, unsafe_allow_html=True)
+
+# # Session state
+# for key, val in [("chunks", []), ("meta", []), ("embeddings", None),
+#                  ("faiss_index", None), ("full_text", ""), ("chat_history", []),
+#                  ("file_info", {}), ("vectorizer", None), ("tables", []), 
+#                  ("visuals", [])]:
+#     if key not in st.session_state:
+#         st.session_state[key] = val
+
+# # Sidebar
+# st.sidebar.markdown("### 📂 Document Upload")
+
+# doc_mode = st.sidebar.radio(
+#     "Processing Mode:",
+#     ["🚀 Smart (Auto-detect)", "🔍 Force OCR (Scanned/Handwritten)"],
+#     help="Smart mode automatically detects which pages need OCR"
+# )
+
+# uploaded_pdfs = st.sidebar.file_uploader(
+#     "📑 PDF Files", 
+#     type="pdf", 
+#     accept_multiple_files=True,
+#     key="pdf_uploader"
+# )
+
+# uploaded_images = st.sidebar.file_uploader(
+#     "🖼️ Image Files", 
+#     type=["jpg", "jpeg", "png", "bmp", "tiff"],
+#     accept_multiple_files=True,
+#     key="img_uploader"
+# )
+
+# st.sidebar.markdown("### ⚙️ Advanced Options")
+# extract_tables = st.sidebar.checkbox("📊 Extract Tables", value=True)
+# detect_visuals = st.sidebar.checkbox("📈 Detect Charts/Diagrams", value=True)
+
+# process_btn = st.sidebar.button("🚀 Process Documents", type="primary", use_container_width=True)
+
+# # Processing
+# if process_btn:
+#     # Clear previous data
+#     for key in ["chunks", "meta", "embeddings", "faiss_index", "full_text", 
+#                 "file_info", "chat_history", "tables", "visuals"]:
+#         if key in ["chunks", "meta", "file_info", "chat_history", "tables", "visuals"]:
+#             st.session_state[key].clear()
+#         else:
+#             st.session_state[key] = None if key != "full_text" else ""
+    
+#     force_ocr = ("Force OCR" in doc_mode)
+#     total_start = time.time()
+    
+#     with st.spinner("⚡ Processing documents with parallel OCR..."):
+#         # Process PDFs
+#         for pdf in uploaded_pdfs or []:
+#             start_time = time.time()
+#             st.info(f"📄 Processing: {pdf.name}")
+#             pdf_bytes = pdf.read()
+            
+#             # Extract tables
+#             if extract_tables:
+#                 with st.spinner(f"📊 Extracting tables from {pdf.name}..."):
+#                     tables = extract_tables_from_pdf(pdf_bytes, pdf.name)
+#                     if tables:
+#                         st.session_state.tables.extend(tables)
+#                         st.success(f"✅ Found {len(tables)} table(s)")
+            
+#             # Detect visuals
+#             if detect_visuals:
+#                 with st.spinner(f"📈 Detecting charts/diagrams in {pdf.name}..."):
+#                     visuals = detect_visual_elements(pdf_bytes, pdf.name)
+#                     if visuals:
+#                         st.session_state.visuals.extend(visuals)
+#                         st.success(f"✅ Found {len(visuals)} visual element(s)")
+            
+#             # Extract text
+#             text, pages_processed, total_pages = extract_text_from_pdf_parallel(
+#                 pdf_bytes, pdf.name, force_ocr=force_ocr
+#             )
+            
+#             processing_time = time.time() - start_time
+            
+#             if text:
+#                 st.session_state.full_text += f"\n\n=== FILE: {pdf.name} ===\n{text}"
+#                 ch, md = chunk_text_smart(text, pdf.name)
+#                 st.session_state.chunks.extend(ch)
+#                 st.session_state.meta.extend(md)
+                
+#                 st.session_state.file_info[pdf.name] = {
+#                     'chars': len(text),
+#                     'pages': total_pages,
+#                     'time': processing_time
+#                 }
+                
+#                 speed = total_pages / processing_time if processing_time > 0 else 0
+#                 st.success(
+#                     f"✅ {pdf.name}: {total_pages} pages in {processing_time:.1f}s "
+#                     f"({speed:.1f} pages/sec)"
+#                 )
+#             else:
+#                 st.warning(f"⚠️ Could not extract text from {pdf.name}")
+        
+#         # Process Images
+#         for img in uploaded_images or []:
+#             start_time = time.time()
+#             st.info(f"🖼️ Processing: {img.name}")
+#             text = extract_text_from_image_fast(img)
+#             processing_time = time.time() - start_time
+            
+#             if text:
+              
+#                 st.session_state.full_text += f"\n\n=== IMAGE: {img.name} ===\n{text}"
+#                 ch, md = chunk_text_smart(text, img.name)
+#                 st.session_state.chunks.extend(ch)
+#                 st.session_state.meta.extend(md)
+                
+#                 st.session_state.file_info[img.name] = {
+#                     'chars': len(text),
+#                     'time': processing_time
+#                 }
+#                 st.success(f"✅ {img.name}: {len(text)} chars in {processing_time:.1f}s")
+#             else:
+#                 st.warning(f"⚠️ Could not extract text from {img.name}")
+        
+#         # Build embeddings
+#         if st.session_state.chunks:
+#             st.info(f"🔢 Creating search index for {len(st.session_state.chunks)} chunks...")
+#             embed_start = time.time()
+            
+#             emb_np, vectorizer = embed_texts_tfidf(st.session_state.chunks)
+#             st.session_state.embeddings = emb_np
+#             st.session_state.vectorizer = vectorizer
+#             st.session_state.faiss_index = build_faiss_index(emb_np)
+            
+#             embed_time = time.time() - embed_start
+#             total_time = time.time() - total_start
+            
+#             st.success(
+#                 f"✅ Search index created in {embed_time:.1f}s | "
+#                 f"Total: {total_time:.1f}s"
+#             )
+            
+#             # Show statistics
+#             st.sidebar.markdown("### 📊 Processing Stats")
+#             total_docs = len(st.session_state.file_info)
+#             total_chunks = len(st.session_state.chunks)
+#             st.sidebar.markdown(f"**Documents:** {total_docs} | **Chunks:** {total_chunks}")
+            
+#             for fname, info in st.session_state.file_info.items():
+#                 if 'pages' in info:
+#                     st.sidebar.text(f"📄 {fname[:25]}...: {info['pages']}p ({info['time']:.1f}s)")
+#                 else:
+#                     st.sidebar.text(f"🖼️ {fname[:25]}...: ({info['time']:.1f}s)")
+            
+#             if st.session_state.tables:
+#                 st.sidebar.markdown(f"**Tables Found:** {len(st.session_state.tables)}")
+            
+#             if st.session_state.visuals:
+#                 st.sidebar.markdown(f"**Visuals Found:** {len(st.session_state.visuals)}")
+#         else:
+#             st.error("❌ No text extracted. Check file quality and OCR settings.")
+
+# # Display extracted tables
+# if st.session_state.tables:
+#     with st.expander(f"📊 Extracted Tables ({len(st.session_state.tables)} found)", expanded=False):
+#         for table_info in st.session_state.tables:
+#             st.markdown(f"**📄 {table_info['doc']} - Page {table_info['page']}, Table {table_info['table_num']}**")
+#             st.dataframe(table_info['data'], use_container_width=True)
+#             st.markdown("---")
+
+# # Display detected visuals
+# if st.session_state.visuals:
+#     with st.expander(f"📈 Detected Charts & Diagrams ({len(st.session_state.visuals)} found)", expanded=False):
+#         cols = st.columns(3)
+#         for idx, visual in enumerate(st.session_state.visuals):
+#             col = cols[idx % 3]
+#             with col:
+#                 st.image(visual['image'], caption=f"{visual['doc']} - Page {visual['page']}\n{visual['type']}", use_container_width=True)
+
+# # Chat Interface
+# st.markdown("---")
+# st.markdown("### 💬 Chat with Your Documents")
+
+# if not st.session_state.faiss_index:
+#     st.info("👆 Upload and process documents using the sidebar first.")
+# else:
+#     # Audio input section
+#     with st.expander("🎤 Voice Input (Optional)", expanded=False):
+#         get_audio_input()
+    
+#     # Text input
+#     user_input = st.text_input(
+#         "Your question:",
+#         placeholder="E.g., 'Summarize in Kannada', 'What dates are mentioned?', 'Translate to Hindi'",
+#         key="user_question"
+#     )
+    
+#     col1, col2 = st.columns([3, 1])
+#     with col1:
+#         ask_button = st.button("📤 Send Question", type="primary", use_container_width=True)
+#     with col2:
+#         audio_output = st.checkbox("🔊 Audio", value=False)
+    
+#     with st.expander("💡 Example Questions", expanded=False):
+#         st.markdown("""
+#         **General Queries:**
+#         - "Summarize this document in Kannada"
+#         - "What is the main topic?"
+#         - "List all important dates mentioned"
+        
+#         **Translation:**
+#         - "Translate the main points to Telugu"
+#         - "Convert this to Hindi"
+        
+#         **Specific Information:**
+#         - "What are the names of people mentioned?"
+#         - "Extract all numerical values"
+#         - "What tables are present?"
+#         """)
+    
+#     if ask_button and user_input:
+#         st.session_state.chat_history.append(("user", user_input))
+        
+#         with st.spinner("🤔 Analyzing..."):
+#             is_summary = any(kw in user_input.lower() for kw in 
+#                            ["summary", "summarize", "overview", "brief", "main points"])
+            
+#             target_lang = extract_target_language(user_input)
+#             if not target_lang:
+#                 target_lang = detect_question_language(user_input)
+            
+#             if is_summary:
+#                 answer = summarize_document(st.session_state.full_text, target_lang)
+#                 source_pages = "Summary from entire document"
+#             else:
+#                 qvec, _ = embed_texts_tfidf(
+#                     [user_input], 
+#                     vectorizer=st.session_state.vectorizer
+#                 )
+#                 qvec = qvec.astype("float32")
+                
+#                 norm = np.linalg.norm(qvec)
+#                 if norm > 0:
+#                     qvec = qvec / norm
+                
+#                 D, I = st.session_state.faiss_index.search(qvec, TOP_K)
+                
+#                 if len(D[0]) == 0 or D[0][0] < SIMILARITY_THRESHOLD:
+#                     answer = "I cannot find relevant information in the documents."
+#                     source_pages = "N/A"
+#                 else:
+#                     context_pieces = []
+#                     total_chars = 0
+#                     source_pages_set = set()
+                    
+#                     for idx, score in zip(I[0], D[0]):
+#                         if idx >= len(st.session_state.chunks):
+#                             continue
+                        
+#                         chunk = st.session_state.chunks[idx]
+#                         source = st.session_state.meta[idx]['source']
+#                         page = st.session_state.meta[idx].get('page', '?')
+                        
+#                         if page and page != '?':
+#                             source_pages_set.add(f"Page {page}")
+                        
+#                         piece = f"[Source: {source}, Page: {page}]\n{chunk}"
+                        
+#                         if total_chars + len(piece) > MAX_CONTEXT_CHARS:
+#                             break
+                        
+#                         context_pieces.append(piece)
+#                         total_chars += len(piece)
+                    
+#                     context = "\n\n---\n\n".join(context_pieces)
+#                     answer = ask_groq_with_context(context, user_input, target_lang)
+                    
+#                     # Sort pages numerically
+#                     try:
+#                         sorted_pages = sorted(source_pages_set, key=lambda x: int(re.findall(r'\d+', x)[0]))
+#                         source_pages = " | ".join(sorted_pages) if sorted_pages else "N/A"
+#                     except:
+#                         source_pages = " | ".join(sorted(source_pages_set)) if source_pages_set else "N/A"
+            
+#             # Add answer with source pages
+#             st.session_state.chat_history.append(("assistant", answer, source_pages))
+            
+#             # Audio output if enabled
+#             if audio_output and answer:
+#                 with st.spinner("🔊 Generating audio..."):
+#                     text_to_speech_button(answer, lang=target_lang)
+    
+#     # Display chat with custom styling
+#     st.markdown("### 📜 Conversation History")
+    
+#     if not st.session_state.chat_history:
+#         st.info("💭 No conversation yet. Ask your first question above!")
+    
+#     for item in st.session_state.chat_history:
+#         if len(item) == 2:
+#             role, message = item
+#             source_pages = None
+#         else:
+#             role, message, source_pages = item
+        
+#         if role == "user":
+#             st.markdown(
+#                 f'<div class="user-message"><strong>👤 You:</strong><br><br>{message}</div>', 
+#                 unsafe_allow_html=True
+#             )
+#         else:
+#             page_badges = ""
+#             if source_pages and source_pages not in ["N/A", "Summary from entire document"]:
+#                 for page in source_pages.split(" | "):
+#                     page_badges += f'<span class="page-reference">📄 {page}</span>'
+#             elif source_pages == "Summary from entire document":
+#                 page_badges = '<span class="page-reference">📄 Full Document</span>'
+            
+#             st.markdown(
+#                 f'<div class="bot-message"><strong>🤖 IntelliDoc:</strong><br>{page_badges}<br><br>{message}</div>', 
+#                 unsafe_allow_html=True
+#             )
+#         st.markdown("<br>", unsafe_allow_html=True)
+    
+#     # Download and Clear buttons
+#     if st.session_state.chat_history:
+#         st.markdown("---")
+#         col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
+        
+#         with col1:
+#             chat_txt = create_chat_download(st.session_state.chat_history)
+#             st.download_button(
+#                 label="📥 Download TXT",
+#                 data=chat_txt,
+#                 file_name=f"intellidoc_chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+#                 mime="text/plain",
+#                 use_container_width=True
+#             )
+        
+#         with col2:
+#             chat_json = create_json_download(st.session_state.chat_history)
+#             st.download_button(
+#                 label="📥 Download JSON",
+#                 data=chat_json,
+#                 file_name=f"intellidoc_chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+#                 mime="application/json",
+#                 use_container_width=True
+#             )
+        
+#         with col3:
+#             # Download full extracted text
+#             st.download_button(
+#                 label="📄 Extracted Text",
+#                 data=st.session_state.full_text,
+#                 file_name=f"extracted_text_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+#                 mime="text/plain",
+#                 use_container_width=True
+#             )
+        
+#         with col4:
+#             if st.button("🗑️ Clear Chat", use_container_width=True):
+#                 st.session_state.chat_history.clear()
+#                 st.rerun()
+
+# # Footer
+# # Footer
+# st.markdown("---")
+# st.markdown("""
+# <div class="footer">
+#     <h3>⚡ Performance & Features</h3>
+#     <div class="feature-grid">
+#         <div class="feature-card">
+#             <strong>🚀 Smart OCR</strong>
+#             <span>Auto-detects when to use OCR</span>
+#         </div>
+#         <div class="feature-card">
+#             <strong>⚡ 3x Faster</strong>
+#             <span>Parallel processing</span>
+#         </div>
+#         <div class="feature-card">
+#             <strong>🌐 10+ Languages</strong>
+#             <span>Multilingual support</span>
+#         </div>
+#         <div class="feature-card">
+#             <strong>📊 Smart Tables</strong>
+#             <span>Automatic extraction</span>
+#         </div>
+#         <div class="feature-card">
+#             <strong>📈 Chart Detection</strong>
+#             <span>Visual element recognition</span>
+#         </div>
+#         <div class="feature-card">
+#             <strong>🔊 Audio I/O</strong>
+#             <span>Voice input & output</span>
+#         </div>
+#     </div>
+#     <p style="margin-top: 20px; font-size: 0.9em;">
+#         <strong>IntelliDoc</strong> v1.0 | Built with Streamlit, PyMuPDF, Tesseract OCR, FAISS & Groq LLM<br>
+#         Supporting: English, Kannada, Hindi, Tamil, Telugu, Marathi, Malayalam, Gujarati, Bengali, Punjabi
+#     </p>
+# </div>
+# """, unsafe_allow_html=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ===================================================================================================================================
+# # Final - code 
+
+
+# #app.py — Ultra-Fast Multilingual PDF Chatbot with Parallel Processing
+# import os
+# import streamlit as st
+# from dotenv import load_dotenv
+# import fitz  # PyMuPDF
+# from PIL import Image
+# import pytesseract
+# import numpy as np
+# import faiss
+# from groq import Groq
+# from langdetect import detect, DetectorFactory
+# from concurrent.futures import ThreadPoolExecutor, as_completed
+# import time
+# from sklearn.feature_extraction.text import TfidfVectorizer
+# from sklearn.metrics.pairwise import cosine_similarity
+
+# DetectorFactory.seed = 0
+
+# # -------------------- Load ENV --------------------
+# load_dotenv()
+# GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# TESSERACT_CMD = os.getenv("TESSERACT_CMD", r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+# TESSDATA_PREFIX = os.getenv("TESSDATA_PREFIX")
 
 # pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 # if TESSDATA_PREFIX:
@@ -896,220 +4232,609 @@
 
 # # -------------------- Config --------------------
 # OCR_LANGS = "eng+kan+hin+tam+tel+mar+mal+guj+ben+pan"
-# EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-# SIMILARITY_THRESHOLD = 0.20
-# TOP_K = 5
+# TOP_K = 8
+# SIMILARITY_THRESHOLD = 0.1
+# CHUNK_SIZE = 1500
+# CHUNK_OVERLAP = 300
+# MAX_CONTEXT_CHARS = 4500
+# MAX_WORKERS = 4  # Parallel processing threads
 
-# embedder = SentenceTransformer(EMBED_MODEL)
+# # -------------------- Clients --------------------
 # groq_client = Groq(api_key=GROQ_API_KEY)
 
-# # ------------------ TEXT EXTRACTION ------------------
-# def extract_text_pymupdf(pdf_bytes):
-#     text = ""
+# # TF-IDF vectorizer for embeddings (no ML libraries needed)
+# @st.cache_resource
+# def get_tfidf_vectorizer():
+#     return TfidfVectorizer(
+#         max_features=1000,
+#         ngram_range=(1, 2),
+#         min_df=1,
+#         stop_words=None  # Keep all words for multilingual support
+#     )
+
+# # -------------------- Smart OCR Detection --------------------
+# def needs_ocr(page):
+#     """Quickly determine if a page needs OCR"""
+#     # Try to extract text
+#     text = page.get_text("text")
+    
+#     # Check if page has extractable text
+#     if len(text.strip()) > 50:
+#         return False
+    
+#     # Check if page has images (likely scanned)
+#     image_list = page.get_images()
+#     if len(image_list) > 0:
+#         return True
+    
+#     return True  # Default to OCR if uncertain
+
+
+# def extract_text_from_page_fast(page, use_ocr=False):
+#     """Fast text extraction with optional OCR"""
+#     if not use_ocr:
+#         # Try native extraction first (FAST)
+#         text = page.get_text("text")
+#         if len(text.strip()) > 50:
+#             return text.strip()
+    
+#     # Use PyMuPDF's integrated OCR (FASTER than pdf2image + pytesseract)
 #     try:
-#         pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
-#         for pg, page in enumerate(pdf, start=1):
-#             t = page.get_text("text")
-#             if t.strip():
-#                 text += f"\n\n[Page {pg}]\n{t}"
-#     except:
+#         # Get page as pixmap at optimal resolution
+#         mat = fitz.Matrix(2.0, 2.0)  # 2x zoom = ~144 DPI (good balance)
+#         pix = page.get_pixmap(matrix=mat, alpha=False)
+        
+#         # Convert to PIL Image
+#         img_data = pix.tobytes("png")
+#         img = Image.open(io.BytesIO(img_data))
+        
+#         # Fast OCR with optimized config
+#         text = pytesseract.image_to_string(
+#             img, 
+#             lang=OCR_LANGS,
+#             config='--psm 6 --oem 3'  # Fast mode
+#         )
+        
+#         return text.strip()
+#     except Exception as e:
+#         st.warning(f"OCR failed on page: {e}")
 #         return ""
-#     return text.strip()
 
-# def extract_text_ocr(pdf_bytes):
-#     text = ""
-#     kwargs = {}
-#     if POPPLER_PATH:
-#         kwargs["poppler_path"] = POPPLER_PATH
 
+# # -------------------- Parallel PDF Processing --------------------
+# def process_page(page_info):
+#     """Process a single page (for parallel execution)"""
+#     page_num, page, doc_name, force_ocr = page_info
+    
 #     try:
-#         images = convert_from_bytes(pdf_bytes, **kwargs)
-#     except:
+#         # Determine if OCR is needed
+#         use_ocr = force_ocr or needs_ocr(page)
+        
+#         # Extract text
+#         text = extract_text_from_page_fast(page, use_ocr=use_ocr)
+        
+#         if text:
+#             return {
+#                 'page_num': page_num,
+#                 'text': f"\n\n[Page {page_num + 1}]\n{text}",
+#                 'doc_name': doc_name,
+#                 'success': True
+#             }
+#         return {'success': False}
+#     except Exception as e:
+#         return {'success': False, 'error': str(e)}
+
+
+# def extract_text_from_pdf_parallel(pdf_bytes, doc_name, force_ocr=False):
+#     """Extract text from PDF using parallel processing"""
+#     try:
+#         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+#         total_pages = len(doc)
+        
+#         # Create page tasks
+#         page_tasks = [
+#             (i, doc[i], doc_name, force_ocr) 
+#             for i in range(total_pages)
+#         ]
+        
+#         # Process pages in parallel
+#         results = []
+#         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+#             future_to_page = {
+#                 executor.submit(process_page, task): task[0] 
+#                 for task in page_tasks
+#             }
+            
+#             for future in as_completed(future_to_page):
+#                 result = future.result()
+#                 if result.get('success'):
+#                     results.append(result)
+        
+#         doc.close()
+        
+#         # Sort by page number and combine
+#         results.sort(key=lambda x: x['page_num'])
+#         full_text = ''.join([r['text'] for r in results])
+        
+#         return full_text, len(results), total_pages
+        
+#     except Exception as e:
+#         st.error(f"PDF processing error: {e}")
+#         return "", 0, 0
+
+
+# def extract_text_from_image_fast(image_file):
+#     """Fast image OCR"""
+#     try:
+#         img = Image.open(image_file)
+        
+#         # Resize if too large (faster processing)
+#         max_size = 2000
+#         if max(img.size) > max_size:
+#             ratio = max_size / max(img.size)
+#             new_size = tuple(int(dim * ratio) for dim in img.size)
+#             img = img.resize(new_size, Image.Resampling.LANCZOS)
+        
+#         # Fast OCR
+#         text = pytesseract.image_to_string(
+#             img,
+#             lang=OCR_LANGS,
+#             config='--psm 6 --oem 3'
+#         )
+        
+#         return text.strip()
+#     except Exception as e:
+#         st.warning(f"Image OCR failed: {e}")
 #         return ""
 
-#     for i, img in enumerate(images, start=1):
-#         try:
-#             t = pytesseract.image_to_string(img, lang=OCR_LANGS)
-#             if t.strip():
-#                 text += f"\n\n[Page {i}]\n{t}"
-#         except:
-#             continue
-#     return text.strip()
 
-# def extract_pdf_text(file_obj):
-#     pdf_bytes = file_obj.read()
-#     text = extract_text_pymupdf(pdf_bytes)
-
-#     if len(text.strip()) < 50:
-#         ocr_text = extract_text_ocr(pdf_bytes)
-#         if len(ocr_text.strip()) > 20:
-#             return ocr_text
-
-#     return text
-
-# # --------------- CHUNKING ------------------
-# def chunk_text(text, src, chunk_size=500, overlap=80):
-#     words = text.split()
+# # -------------------- Chunking --------------------
+# def chunk_text_smart(text, source_name, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+#     """Smart chunking that preserves context"""
+#     if not text or len(text.strip()) < 50:
+#         return [], []
+    
 #     chunks, meta = [], []
-#     i = 0
-#     while i < len(words):
-#         c = " ".join(words[i:i+chunk_size]).strip()
-#         if len(c) > 20:
-#             chunks.append(c)
-#             meta.append({"source": src})
-#         i += chunk_size - overlap
+    
+#     # Split by pages first
+#     pages = text.split('[Page ')
+    
+#     for page_section in pages:
+#         if not page_section.strip():
+#             continue
+        
+#         # Extract page number if present
+#         page_num = None
+#         if ']' in page_section:
+#             try:
+#                 page_num = int(page_section.split(']')[0])
+#                 page_text = page_section.split(']', 1)[1]
+#             except:
+#                 page_text = page_section
+#         else:
+#             page_text = page_section
+        
+#         # Chunk the page text
+#         start = 0
+#         chunk_id = 0
+        
+#         while start < len(page_text):
+#             end = start + chunk_size
+#             chunk = page_text[start:end].strip()
+            
+#             if chunk:
+#                 chunks.append(chunk)
+#                 meta.append({
+#                     "source": source_name,
+#                     "page": page_num,
+#                     "chunk_id": chunk_id
+#                 })
+#                 chunk_id += 1
+            
+#             start += chunk_size - overlap
+    
 #     return chunks, meta
 
-# # ------------------ EMBEDDINGS + FAISS ------------------
-# def build_faiss(vectors):
-#     faiss.normalize_L2(vectors)
-#     idx = faiss.IndexFlatIP(vectors.shape[1])
-#     idx.add(vectors.astype("float32"))
+
+# # -------------------- TF-IDF Embeddings (No PyTorch needed) --------------------
+# def embed_texts_tfidf(texts, vectorizer=None, existing_matrix=None):
+#     """Fast TF-IDF embeddings without ML libraries"""
+#     try:
+#         if vectorizer is None:
+#             vectorizer = get_tfidf_vectorizer()
+#             matrix = vectorizer.fit_transform(texts)
+#         else:
+#             matrix = vectorizer.transform(texts)
+        
+#         return matrix.toarray().astype("float32"), vectorizer
+#     except Exception as e:
+#         st.error(f"Embedding error: {e}")
+#         return np.zeros((len(texts), 100), dtype="float32"), None
+
+
+# def build_faiss_index(emb_np):
+#     """Build FAISS index"""
+#     if emb_np is None or emb_np.shape[0] == 0:
+#         raise ValueError("Empty embeddings")
+    
+#     # Normalize for cosine similarity
+#     norms = np.linalg.norm(emb_np, axis=1, keepdims=True)
+#     norms[norms == 0] = 1  # Avoid division by zero
+#     emb_np = emb_np / norms
+    
+#     dim = emb_np.shape[1]
+#     idx = faiss.IndexFlatIP(dim)
+#     idx.add(emb_np)
 #     return idx
 
-# # --------------- GROQ LLM ------------------
-# def llm_answer(context, question, lang="en", override_pdf_context=False):
-#     language_map = {
-#         "kn": "Kannada", "hi": "Hindi", "ta": "Tamil", "te": "Telugu",
-#         "mr": "Marathi", "ml": "Malayalam", "gu": "Gujarati",
-#         "bn": "Bengali", "pa": "Punjabi", "en": "English"
-#     }
-#     lang_name = language_map.get(lang, "the same language")
 
-#     # special case: user wants full PDF explanation
-#     if override_pdf_context:
-#         system_prompt = f"""
-# You are a PDF explanation assistant.
-# Explain the PDF content in {lang_name}. Summarize, highlight key points, and give important details.
-# Use ONLY the full extracted PDF text given below.
+# # -------------------- Language Utilities --------------------
+# LANG_MAP = {
+#     "kn": "Kannada", "hi": "Hindi", "ta": "Tamil", "te": "Telugu",
+#     "mr": "Marathi", "ml": "Malayalam", "gu": "Gujarati",
+#     "bn": "Bengali", "pa": "Punjabi", "en": "English"
+# }
 
-# --- PDF CONTENT START ---
-# {context}
-# --- PDF CONTENT END ---
-# """
+# LANG_CODES = {
+#     "english": "en", "kannada": "kn", "hindi": "hi", "tamil": "ta",
+#     "telugu": "te", "marathi": "mr", "malayalam": "ml", "gujarati": "gu",
+#     "bengali": "bn", "punjabi": "pa"
+# }
+
+
+# def detect_question_language(question):
+#     try:
+#         return detect(question)
+#     except:
+#         return "en"
+
+
+# def extract_target_language(question):
+#     q_lower = question.lower()
+#     for lang_name, code in LANG_CODES.items():
+#         if f"in {lang_name}" in q_lower or f"to {lang_name}" in q_lower:
+#             return code
+#     return None
+
+
+# # -------------------- QA & Summarization --------------------
+# def ask_groq_with_context(context, question, target_lang=None):
+#     """Answer questions using context"""
+#     if target_lang:
+#         response_lang = LANG_MAP.get(target_lang, "the requested language")
 #     else:
-#         system_prompt = f"""
-# You are a PDF-QA assistant. Use ONLY the provided context to answer.
-# If the answer is not found in the context, say: "This question is not related to the uploaded PDF."
-# Respond in {lang_name}.
+#         question_lang = detect_question_language(question)
+#         response_lang = LANG_MAP.get(question_lang, "English")
+    
+#     is_translation = any(kw in question.lower() for kw in 
+#                          ["translate", "convert", "change to", "in kannada", "in hindi", 
+#                           "in telugu", "in marathi", "in tamil", "in english"])
+    
+#     if is_translation:
+#         prompt = f"""You are a multilingual translator.
 
-# --- CONTEXT START ---
+# CONTEXT from documents:
 # {context}
-# --- CONTEXT END ---
-# """
 
-#     resp = groq_client.chat.completions.create(
-#         model="llama-3.1-8b-instant",
-#         messages=[{"role": "user", "content": system_prompt + "\n\nQuestion:\n" + question}],
-#         temperature=0.0,
-#         max_tokens=700
-#     )
-#     return resp.choices[0].message.content.strip()
+# USER REQUEST: {question}
 
-# # -------------------- STREAMLIT UI --------------------
-# st.set_page_config(page_title="Multilingual PDF Chatbot", layout="wide")
-# st.title("📚 Multilingual PDF Chatbot (Groq + OCR + Vector Search)")
+# Translate the relevant information to {response_lang}. Be accurate and preserve details.
+
+# Response in {response_lang}:"""
+#     else:
+#         prompt = f"""Answer this question using ONLY the CONTEXT provided.
+
+# CONTEXT:
+# {context}
+
+# QUESTION: {question}
+
+# Answer in {response_lang}. If not in context, say "I cannot find this in the documents."
+
+# Answer:"""
+    
+#     try:
+#         resp = groq_client.chat.completions.create(
+#             model="llama-3.3-70b-versatile",
+#             messages=[{"role": "user", "content": prompt}],
+#             temperature=0.1,
+#             max_tokens=1000
+#         )
+#         return resp.choices[0].message.content.strip()
+#     except Exception as e:
+#         return f"Error: {e}"
+
+
+# def summarize_document(text, target_lang="en"):
+#     """Generate summary"""
+#     if not text or len(text.strip()) < 50:
+#         return "Insufficient text to summarize."
+    
+#     text_snippet = text[:8000]
+#     lang_name = LANG_MAP.get(target_lang, "English")
+    
+#     prompt = f"""Summarize this document in {lang_name}. Include main topic, key points, and important details.
+
+# {text_snippet}
+
+# Summary:"""
+    
+#     try:
+#         resp = groq_client.chat.completions.create(
+#             model="llama-3.3-70b-versatile",
+#             messages=[{"role": "user", "content": prompt}],
+#             temperature=0.2,
+#             max_tokens=800
+#         )
+#         return resp.choices[0].message.content.strip()
+#     except Exception as e:
+#         return f"Summarization failed: {e}"
+
+
+# # -------------------- Streamlit UI --------------------
+# import io  # Add this import
+
+# st.set_page_config(page_title="Ultra-Fast PDF Chatbot", layout="wide")
+
+# st.title("⚡ IntelliDoc: AI-Powered Multilingual Document Analysis System")
+# st.markdown("""
+# **Optimized for Speed** - Processes scanned PDFs up to **3x faster** using parallel processing!
+
+# **Features:** Printed & Handwritten | Multi-language | Translation | Q&A | Summaries
+# """)
 
 # # Session state
-# for key, default in {
-#     "chunks": [], "meta": [], "emb": None, "faiss": None,
-#     "full_text": "", "chat": []
-# }.items():
+# for key, val in [("chunks", []), ("meta", []), ("embeddings", None),
+#                  ("faiss_index", None), ("full_text", ""), ("chat_history", []),
+#                  ("file_info", {}), ("processing_stats", {}), ("vectorizer", None)]:
 #     if key not in st.session_state:
-#         st.session_state[key] = default
+#         st.session_state[key] = val
 
 # # Sidebar
-# st.sidebar.header("Upload PDFs")
-# files = st.sidebar.file_uploader("Upload PDFs", accept_multiple_files=True, type=["pdf"])
-# process = st.sidebar.button("Process PDFs")
+# st.sidebar.header("📂 Upload Documents")
 
-# if process:
-#     st.session_state["chunks"] = []
-#     st.session_state["meta"] = []
-#     st.session_state["full_text"] = ""
-#     st.session_state["faiss"] = None
+# doc_mode = st.sidebar.radio(
+#     "Processing Mode:",
+#     ["Smart (Auto-detect)", "Force OCR (Scanned/Handwritten)"],
+#     help="Smart mode is faster for mixed documents"
+# )
 
-#     for f in files:
-#         st.sidebar.write(f"🔄 Extracting: {f.name}")
-#         text = extract_pdf_text(f)
-#         st.session_state["full_text"] += "\n\n" + text
+# uploaded_pdfs = st.sidebar.file_uploader(
+#     "PDF Files", 
+#     type="pdf", 
+#     accept_multiple_files=True,
+#     key="pdf_uploader"
+# )
 
-#         ch, mt = chunk_text(text, f.name)
-#         st.session_state["chunks"].extend(ch)
-#         st.session_state["meta"].extend(mt)
+# uploaded_images = st.sidebar.file_uploader(
+#     "Image Files", 
+#     type=["jpg", "jpeg", "png", "bmp", "tiff"],
+#     accept_multiple_files=True,
+#     key="img_uploader"
+# )
 
-#     # Embeddings
-#     if st.session_state["chunks"]:
-#         vectors = embedder.encode(st.session_state["chunks"], convert_to_numpy=True)
-#         vectors = np.array(vectors, dtype="float32")
-#         st.session_state["emb"] = vectors
-#         st.session_state["faiss"] = build_faiss(vectors)
-#         st.sidebar.success("✔ PDFs processed successfully!")
-#     else:
-#         st.sidebar.error("No text extracted.")
+# process_btn = st.sidebar.button("🚀 Process Documents", type="primary")
 
-# st.markdown("---")
-# st.subheader("Chat")
-
-# if not st.session_state["faiss"]:
-#     st.info("Upload and process PDFs first.")
-# else:
-#     q = st.text_input("Ask a question:", key="ask_box")
-#     ask_btn = st.button("Ask")
-
-#     if ask_btn and q.strip():
-#         st.session_state["chat"].append(("user", q))
-
-#         try:
-#             lang = detect(q)
-#         except:
-#             lang = "en"
-
-#         # Detect full PDF request
-#         explain_trigger = any([
-#             "explain" in q.lower(),
-#             "summary" in q.lower(),
-#             "what is in this pdf" in q.lower(),
-#             "brief" in q.lower()
-#         ])
-
-#         if explain_trigger:
-#             answer = llm_answer(
-#                 context=st.session_state["full_text"],
-#                 question=q,
-#                 lang=lang,
-#                 override_pdf_context=True
+# # Processing
+# if process_btn:
+#     st.session_state.chunks.clear()
+#     st.session_state.meta.clear()
+#     st.session_state.embeddings = None
+#     st.session_state.faiss_index = None
+#     st.session_state.full_text = ""
+#     st.session_state.file_info.clear()
+#     st.session_state.chat_history.clear()
+#     st.session_state.processing_stats.clear()
+    
+#     force_ocr = (doc_mode == "Force OCR (Scanned/Handwritten)")
+    
+#     total_start = time.time()
+    
+#     with st.spinner("⚡ Processing documents with parallel OCR..."):
+#         # Process PDFs
+#         for pdf in uploaded_pdfs or []:
+#             start_time = time.time()
+            
+#             st.info(f"📄 Processing: {pdf.name}")
+#             pdf_bytes = pdf.read()
+            
+#             text, pages_processed, total_pages = extract_text_from_pdf_parallel(
+#                 pdf_bytes, 
+#                 pdf.name,
+#                 force_ocr=force_ocr
 #             )
-#         else:
-#             # vector search
-#             qvec = embedder.encode([q], convert_to_numpy=True).astype("float32")
-#             faiss.normalize_L2(qvec)
-#             D, I = st.session_state["faiss"].search(qvec, TOP_K)
-
-#             if D[0][0] < SIMILARITY_THRESHOLD:
-#                 answer = "This question is not related to the uploaded PDF."
-#             else:
-#                 ctx = "\n\n---\n\n".join(
-#                     f"[{st.session_state['meta'][i]['source']}]\n{st.session_state['chunks'][i]}"
-#                     for i in I[0]
+            
+#             processing_time = time.time() - start_time
+            
+#             if text:
+#                 st.session_state.full_text += f"\n\n=== FILE: {pdf.name} ===\n{text}"
+#                 ch, md = chunk_text_smart(text, pdf.name)
+#                 st.session_state.chunks.extend(ch)
+#                 st.session_state.meta.extend(md)
+                
+#                 st.session_state.file_info[pdf.name] = {
+#                     'chars': len(text),
+#                     'pages': total_pages,
+#                     'time': processing_time
+#                 }
+                
+#                 speed = total_pages / processing_time if processing_time > 0 else 0
+#                 st.success(
+#                     f"✅ {pdf.name}: {total_pages} pages in {processing_time:.1f}s "
+#                     f"({speed:.1f} pages/sec)"
 #                 )
-#                 answer = llm_answer(ctx, q, lang)
+#             else:
+#                 st.warning(f"⚠️ Could not extract text from {pdf.name}")
+        
+#         # Process Images
+#         for img in uploaded_images or []:
+#             start_time = time.time()
+            
+#             st.info(f"🖼️ Processing: {img.name}")
+#             text = extract_text_from_image_fast(img)
+            
+#             processing_time = time.time() - start_time
+            
+#             if text:
+#                 st.session_state.full_text += f"\n\n=== IMAGE: {img.name} ===\n{text}"
+#                 ch, md = chunk_text_smart(text, img.name)
+#                 st.session_state.chunks.extend(ch)
+#                 st.session_state.meta.extend(md)
+                
+#                 st.session_state.file_info[img.name] = {
+#                     'chars': len(text),
+#                     'time': processing_time
+#                 }
+                
+#                 st.success(f"✅ {img.name}: {len(text)} chars in {processing_time:.1f}s")
+#             else:
+#                 st.warning(f"⚠️ Could not extract text from {img.name}")
+        
+#         # Build embeddings
+#         if st.session_state.chunks:
+#             st.info(f"🔢 Creating search index for {len(st.session_state.chunks)} chunks...")
+#             embed_start = time.time()
+            
+#             emb_np, vectorizer = embed_texts_tfidf(st.session_state.chunks)
+#             st.session_state.embeddings = emb_np
+#             st.session_state.vectorizer = vectorizer
+#             st.session_state.faiss_index = build_faiss_index(emb_np)
+            
+#             embed_time = time.time() - embed_start
+#             total_time = time.time() - total_start
+            
+#             st.success(
+#                 f"✅ Search index created in {embed_time:.1f}s | "
+#                 f"Total time: {total_time:.1f}s"
+#             )
+            
+#             # Show statistics
+#             st.sidebar.markdown("### 📊 Processing Stats")
+#             for fname, info in st.session_state.file_info.items():
+#                 if 'pages' in info:
+#                     st.sidebar.text(
+#                         f"• {fname}: {info['pages']} pages "
+#                         f"({info['time']:.1f}s)"
+#                     )
+#                 else:
+#                     st.sidebar.text(
+#                         f"• {fname}: {info['chars']} chars "
+#                         f"({info['time']:.1f}s)"
+#                     )
+#         else:
+#             st.error("❌ No text extracted. Check file quality and OCR settings.")
 
-#         st.session_state["chat"].append(("bot", answer))
+# # Chat Interface
+# st.markdown("---")
+# st.subheader("💬 Chat with Your Documents")
 
-#         # Auto-clear input
-#         st.session_state["ask_box"] = ""
-
+# if not st.session_state.faiss_index:
+#     st.info("👆 Upload and process documents first.")
+# else:
+#     col1, col2 = st.columns([5, 1])
+    
+#     with col1:
+#         user_input = st.text_input(
+#             "Your question:",
+#             placeholder="E.g., 'What is the main topic?' or 'Translate to Hindi'",
+#             key="user_question"
+#         )
+    
+#     with col2:
+#         ask_button = st.button("Send", type="primary")
+    
+#     with st.expander("💡 Example Questions"):
+#         st.markdown("""
+#         - "Summarize this document in Kannada"
+#         - "What dates are mentioned?"
+#         - "Translate the main points to Telugu"
+#         - "List all important names"
+#         - "What is the document about?"
+#         """)
+    
+#     if ask_button and user_input:
+#         st.session_state.chat_history.append(("user", user_input))
+        
+#         with st.spinner("🤔 Thinking..."):
+#             is_summary = any(kw in user_input.lower() for kw in 
+#                            ["summary", "summarize", "overview", "brief", "main points"])
+            
+#             target_lang = extract_target_language(user_input)
+#             if not target_lang:
+#                 target_lang = detect_question_language(user_input)
+            
+#             if is_summary:
+#                 answer = summarize_document(st.session_state.full_text, target_lang)
+#             else:
+#                 # Convert question to TF-IDF vector
+#                 qvec, _ = embed_texts_tfidf(
+#                     [user_input], 
+#                     vectorizer=st.session_state.vectorizer
+#                 )
+#                 qvec = qvec.astype("float32")
+                
+#                 # Normalize query vector
+#                 norm = np.linalg.norm(qvec)
+#                 if norm > 0:
+#                     qvec = qvec / norm
+                
+#                 D, I = st.session_state.faiss_index.search(qvec, TOP_K)
+                
+#                 if len(D[0]) == 0 or D[0][0] < SIMILARITY_THRESHOLD:
+#                     answer = "I cannot find relevant information in the documents."
+#                 else:
+#                     context_pieces = []
+#                     total_chars = 0
+                    
+#                     for idx, score in zip(I[0], D[0]):
+#                         if idx >= len(st.session_state.chunks):
+#                             continue
+                        
+#                         chunk = st.session_state.chunks[idx]
+#                         source = st.session_state.meta[idx]['source']
+#                         page = st.session_state.meta[idx].get('page', '?')
+                        
+#                         piece = f"[Source: {source}, Page: {page}]\n{chunk}"
+                        
+#                         if total_chars + len(piece) > MAX_CONTEXT_CHARS:
+#                             break
+                        
+#                         context_pieces.append(piece)
+#                         total_chars += len(piece)
+                    
+#                     context = "\n\n---\n\n".join(context_pieces)
+#                     answer = ask_groq_with_context(context, user_input, target_lang)
+            
+#             st.session_state.chat_history.append(("assistant", answer))
+    
 #     # Display chat
-#     for r, t in st.session_state["chat"]:
-#         st.markdown(f"**{'You' if r=='user' else 'Bot'}:** {t}")
+#     st.markdown("### 📜 Conversation")
+#     for role, message in st.session_state.chat_history:
+#         if role == "user":
+#             st.markdown(f"**👤 You:** {message}")
+#         else:
+#             st.markdown(f"**🤖 Bot:** {message}")
 #         st.markdown("---")
+    
+#     if st.button("🗑️ Clear Chat"):
+#         st.session_state.chat_history.clear()
+#         st.rerun()
 
+# # Footer
+# st.markdown("---")
+# st.markdown("""
+# ### ⚡ Performance Tips:
+# - **Smart Mode**: Automatically detects which pages need OCR (faster)
+# - **Force OCR**: Use for handwritten or poor-quality scans (slower but thorough)
+# - **Parallel Processing**: Processes multiple pages simultaneously (3x faster)
+# - **High-Resolution Scans**: 300 DPI recommended for best results
+# """)
 
 
 
 
 
+ 
 
 
 
@@ -1125,303 +4850,12 @@
 
 
 
-#=========================================================================================================================================================================
 
-#  2
 
 
 
 
-import os
-import tempfile
-import streamlit as st
-from dotenv import load_dotenv
-import fitz  # PyMuPDF
-from pdf2image import convert_from_bytes
-import pytesseract
+#===============================================================================================================================
 
-from sentence_transformers import SentenceTransformer
-import numpy as np
-import faiss
-from groq import Groq
 
-from langdetect import detect, DetectorFactory
 
-# Stable language detection (deterministic)
-DetectorFactory.seed = 0
-
-# -------------------- Load env --------------------
-load_dotenv()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-TESSERACT_CMD = os.getenv("TESSERACT_CMD", r"C:\Program Files\Tesseract-OCR\tesseract.exe")
-TESSDATA_PREFIX = os.getenv("TESSDATA_PREFIX")  # optional
-POPPLER_PATH = os.getenv("POPPLER_PATH")  # optional, used by pdf2image on Windows if needed
-
-# set up Tesseract
-pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
-if TESSDATA_PREFIX:
-    os.environ["TESSDATA_PREFIX"] = TESSDATA_PREFIX
-
-# -------------------- Config --------------------
-OCR_LANGS = "eng+kan+hin+tam+tel+mar+mal+guj+ben+pan"
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-EMBED_BATCH_SIZE = 64
-TOP_K = 5
-SIMILARITY_THRESHOLD = 0.25  # inner product threshold after normalization (tweakable)
-
-# -------------------- Clients / Models --------------------
-groq_client = Groq(api_key=GROQ_API_KEY)
-embedder = SentenceTransformer(EMBED_MODEL)
-
-# -------------------- Helpers --------------------
-def extract_text_with_pymupdf_bytes(pdf_bytes):
-    """Try text extraction via PyMuPDF (fast for text PDFs)."""
-    text = ""
-    try:
-        pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
-        for pageno, page in enumerate(pdf, start=1):
-            page_text = page.get_text("text")
-            if page_text:
-                text += f"\n\n[Page {pageno}]\n" + page_text
-    except Exception:
-        return ""
-    return text.strip()
-
-
-def extract_text_with_ocr_bytes(pdf_bytes):
-    """Convert to images and run pytesseract OCR (slower, but works for scanned)."""
-    text = ""
-    convert_kwargs = {}
-    if POPPLER_PATH:
-        convert_kwargs["poppler_path"] = POPPLER_PATH
-    images = convert_from_bytes(pdf_bytes, **convert_kwargs)
-    for i, img in enumerate(images, start=1):
-        try:
-            page_text = pytesseract.image_to_string(img, lang=OCR_LANGS)
-            if page_text and page_text.strip():
-                text += f"\n\n[Page {i}]\n" + page_text
-        except Exception as e:
-            # continue on OCR errors for some pages
-            continue
-    return text.strip()
-
-
-def extract_pdf_text(file_obj):
-    """Try PyMuPDF first; if insufficient text -> fallback to OCR"""
-    pdf_bytes = file_obj.read()
-    text = extract_text_with_pymupdf_bytes(pdf_bytes)
-    # if text is tiny/empty, fallback to OCR
-    if len(text.strip()) < 50:
-        ocr_text = extract_text_with_ocr_bytes(pdf_bytes)
-        if len(ocr_text.strip()) > 20:
-            text = ocr_text
-    return text
-
-
-def chunk_text_keep_meta(text, source_name, chunk_size_words=500, chunk_overlap=50):
-    """Chunk text into overlapping word-chunks, keep metadata (source, optional page header)."""
-    words = text.split()
-    chunks = []
-    metadatas = []
-    i = 0
-    n = len(words)
-    while i < n:
-        chunk_words = words[i:i+chunk_size_words]
-        chunk_text = " ".join(chunk_words).strip()
-        if chunk_text:
-            chunks.append(chunk_text)
-            metadatas.append({"source": source_name})
-        i += chunk_size_words - chunk_overlap
-    return chunks, metadatas
-
-
-def build_faiss_index(embeddings_np):
-    """Build an FAISS index for cosine similarity using IndexFlatIP and normalized vectors."""
-    if embeddings_np is None or embeddings_np.shape[0] == 0:
-        raise ValueError("Empty embeddings provided.")
-    # normalize vectors (L2) so inner product == cosine similarity
-    faiss.normalize_L2(embeddings_np)
-    dim = embeddings_np.shape[1]
-    index = faiss.IndexFlatIP(dim)
-    index.add(embeddings_np.astype("float32"))
-    return index
-
-
-def embed_texts_in_batches(texts):
-    """Use sentence-transformers to encode and return numpy array."""
-    if not texts:
-        return np.zeros((0, embedder.get_sentence_embedding_dimension()), dtype="float32")
-    vectors = embedder.encode(texts, convert_to_numpy=True, show_progress_bar=False, batch_size=EMBED_BATCH_SIZE)
-    return np.asarray(vectors, dtype="float32")
-
-
-def ask_groq_with_context(context, question, lang_code="en"):
-    """Call Groq chat with a strict prompt that asks to use context and avoid hallucination."""
-    # instruct the model to answer in the detected language
-    language_map = {
-        "kn": "Kannada", "hi": "Hindi", "ta": "Tamil", "te": "Telugu", "mr": "Marathi",
-        "ml": "Malayalam", "gu": "Gujarati", "bn": "Bengali", "pa": "Punjabi", "en": "English"
-    }
-    lang_name = language_map.get(lang_code, "the same language as the question")
-    prompt = f"""
-You are a careful PDF-QA assistant. Use only the CONTEXT passages below to answer the QUESTION.
-If the answer cannot be found in the provided context, reply exactly: "This question is not related to the uploaded PDF."
-Answer concisely and in {lang_name}.
-
---- CONTEXT START ---
-{context}
---- CONTEXT END ---
-
-QUESTION:
-{question}
-
-Answer:
-"""
-    resp = groq_client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[{"role":"user", "content": prompt}],
-        temperature=0.0,
-        max_tokens=600
-    )
-    # Groq API returns choices
-    try:
-        return resp.choices[0].message.content.strip()
-    except Exception:
-        # fallback
-        return "Sorry, I couldn't get an answer from the LLM."
-
-
-# -------------------- Streamlit UI --------------------
-st.set_page_config(page_title="Multilingual PDF Chatbot", page_icon="📚", layout="wide")
-st.title("📄 Multilingual PDF Chatbot — Local embeddings + Groq")
-
-# session state initializations
-if "docs_chunks" not in st.session_state:
-    st.session_state.docs_chunks = []        # list of chunk strings
-if "docs_meta" not in st.session_state:
-    st.session_state.docs_meta = []          # list of metadata dicts aligned with chunks
-if "embeddings" not in st.session_state:
-    st.session_state.embeddings = None       # numpy array
-if "faiss_index" not in st.session_state:
-    st.session_state.faiss_index = None
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []       # list of (role, text)
-if "processed_files" not in st.session_state:
-    st.session_state.processed_files = []    # filenames processed
-
-st.sidebar.header("Upload PDFs")
-uploaded_files = st.sidebar.file_uploader("Upload one or more PDFs (text or scanned)", accept_multiple_files=True, type=["pdf"])
-
-process_btn = st.sidebar.button("Process PDFs", key="process_pdfs_btn")
-
-if process_btn:
-    if not uploaded_files:
-        st.sidebar.error("Please upload at least one PDF.")
-    else:
-        # Reset indexes & buffers
-        st.session_state.docs_chunks = []
-        st.session_state.docs_meta = []
-        st.session_state.embeddings = None
-        st.session_state.faiss_index = None
-        st.session_state.processed_files = []
-
-        with st.sidebar.expander("Processing...", expanded=True):
-            for pdf_f in uploaded_files:
-                fname = pdf_f.name
-                st.write(f"Processing: {fname} ...")
-                text = extract_pdf_text(pdf_f)
-                if not text or len(text.strip()) < 20:
-                    st.write(" → no text detected, OCR fallback used (or empty).")
-                chunks, metas = chunk_text_keep_meta(text, source_name=fname, chunk_size_words=500, chunk_overlap=80)
-                # filter out very short chunks
-                filtered = [(c,m) for c,m in zip(chunks, metas) if len(c.strip()) > 20]
-                if not filtered:
-                    st.write(f"Warning: no usable text extracted from {fname}")
-                    continue
-                for c,m in filtered:
-                    st.session_state.docs_chunks.append(c)
-                    st.session_state.docs_meta.append(m)
-                st.session_state.processed_files.append(fname)
-                st.write(f" → {len(filtered)} chunks added from {fname}")
-
-        # create embeddings (if any chunks)
-        if st.session_state.docs_chunks:
-            st.sidebar.info("Computing embeddings (this can take a moment)...")
-            embeddings_np = embed_texts_in_batches(st.session_state.docs_chunks)
-            if embeddings_np.shape[0] == 0:
-                st.sidebar.error("No embeddings produced. Check PDF extraction / model.")
-            else:
-                st.session_state.embeddings = embeddings_np
-                st.session_state.faiss_index = build_faiss_index(embeddings_np.copy())
-                st.sidebar.success(f"Vector store created with {embeddings_np.shape[0]} vectors.")
-        else:
-            st.sidebar.error("No chunks were extracted from uploaded PDFs.")
-
-st.markdown("---")
-st.subheader("Chat")
-
-if not st.session_state.faiss_index:
-    st.info("Upload and Process PDFs (sidebar) to enable chat.")
-else:
-    # persistent chat input
-    user_input = st.text_input("Ask a question (in any language):", key="main_question_box")
-    ask = st.button("Ask", key="ask_btn")
-
-    if ask and user_input and user_input.strip():
-        # remember user message
-        st.session_state.chat_history.append(("user", user_input.strip()))
-
-        # detect question language (best-effort)
-        try:
-            user_lang = detect(user_input)
-        except Exception:
-            user_lang = "en"
-
-        # embed question and search
-        qvec = embedder.encode([user_input], convert_to_numpy=True)
-        qvec = np.asarray(qvec, dtype="float32")
-        faiss.normalize_L2(qvec)
-        D, I = st.session_state.faiss_index.search(qvec, TOP_K)  # D: inner products
-
-        top_scores = D[0] if D.shape[0] else []
-        top_idx = I[0] if I.shape[0] else []
-
-        if len(top_scores) == 0 or top_scores[0] < SIMILARITY_THRESHOLD:
-            bot_response = "This question is not related to the uploaded PDF."
-        else:
-            # assemble context from top chunks (include metadata)
-            context_pieces = []
-            for idx in top_idx:
-                if idx < len(st.session_state.docs_chunks):
-                    md = st.session_state.docs_meta[idx]
-                    chunk = st.session_state.docs_chunks[idx]
-                    context_pieces.append(f"[Source: {md.get('source','unknown')}]\n{chunk}")
-            context = "\n\n---\n\n".join(context_pieces)
-            bot_response = ask_groq_with_context(context, user_input, lang_code=user_lang)
-
-        st.session_state.chat_history.append(("bot", bot_response))
-
-    # Display chat history (most recent last)
-    st.markdown("### Conversation")
-    for role, text in st.session_state.chat_history:
-        if role == "user":
-            st.markdown(f"**You:** {text}")
-        else:
-            st.markdown(f"**Bot:** {text}")
-        st.markdown("---")
-
-# Simple footer / tips
-st.markdown(
-    """
-**Tips & Notes**
-- For scanned PDFs ensure Tesseract traineddata for the languages you need are installed in your `tessdata` folder.
-- If OCR results are poor, try increasing image DPI or check Tesseract language packs.
-- Similarity threshold may be tuned (currently set to reduce hallucinations).
-"""
-)
-
-
-
-
-
-# #===================================================================================================================================
