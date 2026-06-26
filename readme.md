@@ -336,7 +336,7 @@ gtts          # Text-to-speech output
 ## 👩‍💻 Author
 
 **Shakuntala Pawar**
-B.Tech CSE — Visvesvaraya Technological University (VTU), 2026 
+B.Tech CSE — Visvesvaraya Technological University (VTU), 2026
 
 [![GitHub](https://img.shields.io/badge/GitHub-shakuntala--pawar-181717?style=flat&logo=github)](https://github.com/shakuntala-pawar)
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Shakuntala%20Pawar-0077B5?style=flat&logo=linkedin)](https://www.linkedin.com/in/shakuntala-pawar-283a5632b/)
